@@ -1,0 +1,1669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<title>Source: includes/class-sensei-settings.php - Sensei LMS Hook Docs</title>
+
+	<script src="scripts/prettify/prettify.js"> </script>
+	<script src="scripts/prettify/lang-css.js"> </script>
+	<!--[if lt IE 9]>
+	  <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+	<![endif]-->
+	<link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+	<link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+
+	<link href="https://fonts.googleapis.com/css?family=IBM+Plex+Mono|IBM+Plex+Sans:300,400|Playfair+Display:900&display=swap" rel="stylesheet">
+	<link type="text/css" rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+
+<div id="main">
+
+	
+	<h1 class="page-title">Source: includes/class-sensei-settings.php</h1>
+	
+
+	
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>&lt;?php
+
+use Sensei\Internal\Installer\Eraser;
+use Sensei\Internal\Installer\Schema;
+use Sensei\Internal\Services\Progress_Storage_Settings;
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit; // Exit if accessed directly
+}
+
+/*
+ * Sensei Settings Class
+ *
+ * All functionality pertaining to the settings in Sensei.
+ *
+ * @package Core
+ * @author Automattic
+ *
+ * @since 1.0.0
+ */
+class Sensei_Settings extends Sensei_Settings_API {
+
+	const VISITED_SECTIONS_OPTION_KEY = 'sensei_settings_sections_visited';
+
+	/**
+	 * Constructor.
+	 *
+	 * @access public
+	 * @since 1.0.0
+	 */
+	public function __construct() {
+		parent::__construct(); // Required in extended classes.
+
+		// Setup Admin Settings data
+		if ( is_admin() ) {
+			$this->has_tabs  = true;
+			$this->page_slug = 'sensei-settings';
+		}
+
+		$this->register_hook_listener();
+		$this->get_settings();
+
+		// Flush rewrite rules on settings update.
+		add_action( 'init', array( $this, 'flush_rewrite_rules_on_update' ), 10, 0 );
+
+		// Log when settings are updated by the user.
+		add_action( 'update_option_sensei-settings', [ $this, 'log_settings_update' ], 10, 2 );
+
+		// Mark settings section as visited on ajax action received.
+		add_action( 'wp_ajax_sensei_settings_section_visited', [ $this, 'mark_section_as_visited' ] );
+
+		// Do preparation for enabled experimental features.
+		add_filter( 'pre_update_option_sensei-settings', [ $this, 'before_experimental_features_saved' ], 10, 2 );
+		add_action( 'update_option_sensei-settings', [ $this, 'experimental_features_saved' ], 10, 2 );
+	}
+
+	/**
+	 * Get settings value
+	 *
+	 * @since 1.9.0
+	 * @param string $setting_name
+	 * @return mixed
+	 */
+	public function get( $setting_name ) {
+
+		if ( isset( $this->settings[ $setting_name ] ) ) {
+
+			return $this->settings[ $setting_name ];
+
+		}
+
+		return false;
+	}
+
+	/**
+	 * Get the name of the screen.
+	 *
+	 * @return string
+	 */
+	protected function get_name() {
+		return __( 'Sensei LMS Settings', 'sensei-lms' );
+	}
+
+	/**
+	 * Get the menu label.
+	 *
+	 * @return string
+	 */
+	protected function get_menu_label() {
+		return __( 'Settings', 'sensei-lms' );
+	}
+
+	/**
+	 * Get my courses page ID.
+	 *
+	 * @since 4.23.1
+	 *
+	 * @return int
+	 */
+	public function get_my_courses_page_id() {
+		/**
+		 * Filters the My Courses page ID.
+		 *
+		 * @hook sensei_settings_my_course_page_id
+		 *
+		 * @since 4.23.1
+		 *
+		 * @param {int} $page_id The My Courses page ID.
+		 * @return {int} Filtered My Courses page ID.
+		 */
+		$page_id = apply_filters( 'sensei_settings_my_course_page_id', $this->get( 'my_course_page' ) );
+
+		return absint( $page_id );
+	}
+
+	/**
+	 * @since 1.9.0
+	 *
+	 * @param $setting
+	 * @param $new_value
+	 */
+	public function set( $setting, $new_value ) {
+
+		$settings             = $this->get_settings();
+		$settings[ $setting ] = $new_value;
+
+		// Update the cached setting.
+		$this->settings[ $setting ] = $new_value;
+
+		return update_option( $this->token, $settings );
+
+	}
+
+	/**
+	 * Register the settings screen within the WordPress admin.
+	 *
+	 * @access public
+	 * @since  1.0.0
+	 */
+	public function register_settings_screen() {
+		$this->settings_version = Sensei()->version; // Use the global plugin version on this settings screen.
+		$this->hook             = add_submenu_page(
+			'sensei',
+			$this->get_name(),
+			$this->get_menu_label(),
+			'manage_sensei',
+			$this->page_slug,
+			array( $this, 'settings_screen' )
+		);
+
+		if ( isset( $_GET['page'] ) &amp;&amp; ( $_GET['page'] == $this->page_slug ) ) {
+			add_action( 'admin_notices', array( $this, 'settings_errors' ) );
+			add_action( 'admin_print_scripts', array( $this, 'enqueue_scripts' ) );
+			add_action( 'admin_print_styles', array( $this, 'enqueue_styles' ) );
+		}
+	}
+
+	/**
+	 * Output the settings screen.
+	 */
+	public function settings_screen() {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Nonce verification not required.
+		$tab_name = sanitize_key( wp_unslash( $_GET['tab'] ?? '' ) );
+
+		/**
+		 * Filters content for the settings page.
+		 *
+		 * @since 4.12.0
+		 *
+		 * @hook  sensei_settings_content
+		 *
+		 * @param {string} $tab_name The tab slug.
+		 * @return {string} Filtered tab content.
+		 */
+		$content = apply_filters( 'sensei_settings_content', $tab_name );
+
+		if ( empty( $content ) ) {
+			parent::settings_screen();
+			return;
+		}
+
+		// Render content on the Emails settings page.
+		Sensei()->assets->enqueue_style( 'wp-components' );
+		?>
+		&lt;div id="woothemes-sensei" class="wrap &lt;?php echo esc_attr( $this->token ); ?>">
+			&lt;div id="sensei-custom-navigation" class="sensei-custom-navigation">
+				&lt;div class="sensei-custom-navigation__heading">
+					&lt;div class="sensei-custom-navigation__title">
+						&lt;h1>
+							&lt;?php
+							echo esc_html( $this->get_name() );
+
+							if ( '' !== $this->settings_version ) {
+								echo ' &lt;span class="version">' . esc_html( $this->settings_version ) . '&lt;/span>';
+							}
+							?>
+						&lt;/h1>
+					&lt;/div>
+					&lt;div class="sensei-custom-navigation__links">
+						&lt;?php $this->settings_tabs(); ?>
+					&lt;/div>
+				&lt;/div>
+				&lt;?php
+					/**
+					 * Fires after the navigation links are displayed.
+					 *
+					 * @since 4.12.0
+					 *
+					 * @hook  sensei_settings_after_links
+					 *
+					 * @param {string} $tab_name The tab slug.
+					 */
+					do_action( 'sensei_settings_after_links', $tab_name );
+				?>
+			&lt;/div>
+			&lt;?php
+			// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+			echo $content;
+			?>
+		&lt;/div>
+		&lt;?php
+	}
+
+	/**
+	 * Add legacy options to alloptions if they don't exist.
+	 *
+	 * @since 3.0.1
+	 * @deprecated 4.13.1
+	 *
+	 * @param array $alloptions All options that are preloaded by WordPress.
+	 *
+	 * @return array
+	 */
+	public function no_special_query_for_legacy_options( $alloptions ) {
+		_deprecated_function( __METHOD__, '4.13.1' );
+
+		return $alloptions;
+	}
+
+	/**
+	 * Add settings sections.
+	 *
+	 * @access public
+	 * @since  1.0.0
+	 * @return void
+	 */
+	public function init_sections() {
+		$sections = array();
+
+		$sections['default-settings'] = array(
+			'name'        => __( 'General', 'sensei-lms' ),
+			'description' => __( 'Settings that apply to the entire plugin.', 'sensei-lms' ),
+		);
+
+		$sections['appearance-settings'] = array(
+			'name'        => __( 'Appearance', 'sensei-lms' ),
+			'description' => __( 'Settings that apply to the entire plugin.', 'sensei-lms' ),
+		);
+
+		$sections['course-settings'] = array(
+			'name'        => __( 'Courses', 'sensei-lms' ),
+			'description' => __( 'Settings that apply to all Courses.', 'sensei-lms' ),
+		);
+
+		$sections['lesson-settings'] = array(
+			'name'        => __( 'Lessons', 'sensei-lms' ),
+			'description' => __( 'Settings that apply to all Lessons.', 'sensei-lms' ),
+		);
+
+		$sections['email-notification-settings'] = array(
+			'name'        => __( 'Email Notifications', 'sensei-lms' ),
+			'description' => __( 'Settings for email notifications sent from your site.', 'sensei-lms' ),
+		);
+
+		$sections['learner-profile-settings'] = array(
+			'name'        => __( 'Student Profiles', 'sensei-lms' ),
+			'description' => __( 'Settings for public Student Profiles.', 'sensei-lms' ),
+		);
+
+		/**
+		 * Filters the woocommerce promo settings section.
+		 *
+		 * Hook used to hide woocommerce promo banner and section.
+
+		 * @since 4.1.0
+		 *
+		 * @hook sensei_settings_woocommerce_hide
+		 *
+		 * @param {bool} $hide_woocommerce_settings  Boolean value that defines if the woocommerce promo banner should be hidden.
+		 * @return {bool} Filtered boolean value that defines if the woocommerce promo banner should be hidden.
+		 */
+		$hide_woocommerce_settings = apply_filters( 'sensei_settings_woocommerce_hide', false );
+		if ( ! $hide_woocommerce_settings ) {
+			$sections['woocommerce-settings'] = array(
+				'name'        => __( 'WooCommerce', 'sensei-lms' ),
+				'description' => __( 'Optional settings for WooCommerce functions.', 'sensei-lms' ),
+			);
+		}
+
+		/**
+		 * Filters the content drip promo settings section.
+		 *
+		 * Hook used to hide content drip promo banner and section.
+		 *
+		 * @since 4.1.0
+		 *
+		 * @hook sensei_settings_content_drip_hide
+		 *
+		 * @param {bool} $hide_content_drip_settings  Boolean value that defines if the content drip promo banner should be hidden.
+		 * @return {bool} Filtered boolean value that defines if the content drip promo banner should be hidden.
+		 */
+		$hide_content_drip_settings = apply_filters( 'sensei_settings_content_drip_hide', false );
+		if ( ! $hide_content_drip_settings ) {
+			$sections['sensei-content-drip-settings'] = array(
+				'name'        => __( 'Content Drip', 'sensei-lms' ),
+				'description' => __( 'Optional settings for the Content Drip extension.', 'sensei-lms' ),
+			);
+		}
+
+		if ( Sensei()->feature_flags->is_enabled( 'experimental_features_ui' ) ) {
+			$sections['sensei-experimental-features'] = array(
+				'name'        => __( 'Experimental Features', 'sensei-lms' ),
+				'description' => __( 'Experimental features that are incomplete and not yet ready for production.', 'sensei-lms' ),
+			);
+		}
+
+		/**
+		 * Filters settings tabs.
+		 *
+		 * @hook sensei_settings_tabs
+		 *
+		 * @param {array} $sections  Array of settings sections.
+		 * @return {array} Filtered array of settings sections.
+		 */
+		$this->sections = apply_filters( 'sensei_settings_tabs', $sections );
+	}
+
+	/**
+	 * Add settings fields.
+	 *
+	 * @access public
+	 * @since  1.0.0
+	 * @uses   Sensei_Utils::get_slider_types()
+	 * @return void
+	 */
+	public function init_fields() {
+		$pages_array          = $this->pages_array();
+		$posts_per_page_array = array(
+			'0'  => '0',
+			'1'  => '1',
+			'2'  => '2',
+			'3'  => '3',
+			'4'  => '4',
+			'5'  => '5',
+			'6'  => '6',
+			'7'  => '7',
+			'8'  => '8',
+			'9'  => '9',
+			'10' => '10',
+			'11' => '11',
+			'12' => '12',
+			'13' => '13',
+			'14' => '14',
+			'15' => '15',
+			'16' => '16',
+			'17' => '17',
+			'18' => '18',
+			'19' => '19',
+			'20' => '20',
+		);
+		$complete_settings    = array(
+			'passed'   => __( 'Once all the course lessons have been completed', 'sensei-lms' ),
+			'complete' => __( 'At any time (by clicking the \'Complete Course\' button)', 'sensei-lms' ),
+		);
+		$quiz_points_formats  = array(
+			'none'     => __( "Don't show quiz question points", 'sensei-lms' ),
+			'number'   => __( 'Number (e.g. 1. Default)', 'sensei-lms' ),
+			'brackets' => __( 'Brackets (e.g. [1])', 'sensei-lms' ),
+			'text'     => __( 'Text (e.g. Points: 1)', 'sensei-lms' ),
+			'full'     => __( 'Text and Brackets (e.g. [Points: 1])', 'sensei-lms' ),
+		);
+		$fields               = array();
+
+		$fields['access_permission'] = array(
+			'name'        => __( 'Access Permissions', 'sensei-lms' ),
+			'description' => __( 'Users must be logged in to view lesson content.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => true,
+			'section'     => 'default-settings',
+		);
+
+		$fields['messages_disable'] = array(
+			'name'        => __( 'Disable Private Messages', 'sensei-lms' ),
+			'description' => __( 'Disable the private message functions between students and teachers.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => false,
+			'section'     => 'default-settings',
+		);
+
+		$fields['course_page'] = array(
+			'name'        => __( 'Course Archive Page', 'sensei-lms' ),
+			'description' => sprintf(
+				// translators: Placeholder is the docs link.
+				__( 'The &lt;a href="%s" target="_blank">page&lt;/a> to use to display courses. If you leave this blank the default custom post type archive will apply.', 'sensei-lms' ),
+				'https://senseilms.com/documentation/sensei-pages/#courses'
+			),
+			'type'        => 'select',
+			'default'     => 0,
+			'section'     => 'default-settings',
+			'required'    => 0,
+			'options'     => $pages_array,
+		);
+
+		$fields['my_course_page'] = array(
+			'name'        => __( 'My Courses Page', 'sensei-lms' ),
+			'description' => sprintf(
+				// translators: Placeholder is the docs link.
+				__( 'The &lt;a href="%s" target="_blank">page&lt;/a> to use to display the courses that a user is currently taking as well as the courses a user has complete.', 'sensei-lms' ),
+				'https://senseilms.com/documentation/sensei-pages/#my-courses'
+			),
+			'type'        => 'select',
+			'default'     => 0,
+			'section'     => 'default-settings',
+			'required'    => 0,
+			'options'     => $pages_array,
+		);
+
+		$fields['course_completed_page'] = array(
+			'name'        => __( 'Course Completed Page', 'sensei-lms' ),
+			'description' => sprintf(
+				// translators: Placeholder is the docs link.
+				__( 'The &lt;a href="%s" target="_blank">page&lt;/a> that is displayed after a student completes a course.', 'sensei-lms' ),
+				'https://senseilms.com/documentation/sensei-pages/#course-completed'
+			),
+			'type'        => 'select',
+			'default'     => 0,
+			'section'     => 'default-settings',
+			'required'    => 0,
+			'options'     => $pages_array,
+		);
+
+		$fields['placeholder_images_enable'] = array(
+			'name'        => __( 'Use placeholder images', 'sensei-lms' ),
+			'description' => __( 'Output a placeholder image when no featured image has been specified for Courses and Lessons.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => false,
+			'section'     => 'default-settings',
+		);
+
+		$fields['styles_disable']              = array(
+			'name'        => __( 'Disable Sensei LMS Styles', 'sensei-lms' ),
+			'description' => __( 'Prevent the frontend stylesheets from loading. This will remove the default styles for all Sensei LMS elements.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => false,
+			'section'     => 'default-settings',
+		);
+		$fields['quiz_question_points_format'] = array(
+			'name'        => __( 'Quiz question points format', 'sensei-lms' ),
+			'description' => __( 'Set the quiz question points format', 'sensei-lms' ),
+			'type'        => 'select',
+			'default'     => 'number',
+			'section'     => 'default-settings',
+			'options'     => $quiz_points_formats,
+		);
+
+		$fields['js_disable'] = array(
+			'name'        => __( 'Disable Sensei LMS Javascript', 'sensei-lms' ),
+			'description' => __( 'Prevent the frontend javascript from loading. This affects the progress bars and the My Courses tabs.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => false,
+			'section'     => 'default-settings',
+		);
+
+		$fields['sensei_video_embed_html_sanitization_disable'] = array(
+			'name'        => __( 'Disable HTML security', 'sensei-lms' ),
+			'description' => __( 'Allow any HTML tags in the Video Embed field. Warning: Enabling this may leave your site more vulnerable to XSS attacks', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => false,
+			'section'     => 'default-settings',
+		);
+
+		$fields['sensei_delete_data_on_uninstall'] = array(
+			'name'        => __( 'Delete data on uninstall', 'sensei-lms' ),
+			'description' => __( 'Delete Sensei LMS data when the plugin is deleted. Once removed, this data cannot be restored.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => false,
+			'section'     => 'default-settings',
+		);
+
+		$fields['course_completion'] = array(
+			'name'        => __( 'Courses are complete:', 'sensei-lms' ),
+			'description' => __( 'This will determine when courses are marked as complete.', 'sensei-lms' ),
+			'type'        => 'select',
+			'default'     => 'passed',
+			'section'     => 'course-settings',
+			'required'    => 0,
+			'options'     => $complete_settings,
+		);
+
+		$fields['course_author'] = array(
+			'name'        => __( 'Course Author', 'sensei-lms' ),
+			'description' => __( 'Display the author on the Course Archive and My Courses pages. This setting does not apply when these pages use blocks.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => true,
+			'section'     => 'course-settings',
+		);
+
+		$fields['my_course_amount'] = array(
+			'name'        => __( 'My Courses Pagination', 'sensei-lms' ),
+			'description' => __( 'The number of courses to output for the my courses page.', 'sensei-lms' ),
+			'type'        => 'range',
+			'default'     => '0',
+			'section'     => 'course-settings',
+			'required'    => 0,
+			'options'     => $posts_per_page_array,
+		);
+
+		$fields['course_archive_image_enable'] = array(
+			'name'        => __( 'Course Archive Image', 'sensei-lms' ),
+			'description' => __( 'Output the Course Image on the Course Archive Page.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => true,
+			'section'     => 'course-settings',
+		);
+
+		$fields['course_archive_image_width'] = array(
+			'name'        => __( 'Image Width - Archive', 'sensei-lms' ),
+			'description' => __( 'The width in pixels of the featured image for the Course Archive page.', 'sensei-lms' ),
+			'type'        => 'text',
+			'default'     => '100',
+			'section'     => 'course-settings',
+			'required'    => 0,
+		);
+
+		$fields['course_archive_image_height'] = array(
+			'name'        => __( 'Image Height - Archive', 'sensei-lms' ),
+			'description' => __( 'The height in pixels of the featured image for the Course Archive page.', 'sensei-lms' ),
+			'type'        => 'text',
+			'default'     => '100',
+			'section'     => 'course-settings',
+			'required'    => 0,
+		);
+
+		$fields['course_archive_image_hard_crop'] = array(
+			'name'        => __( 'Image Hard Crop - Archive', 'sensei-lms' ),
+			// translators: Placeholders are an opening and closing &lt;a> tag linking to the documentation page.
+			'description' => sprintf( __( 'After changing this setting, you may need to %1$sregenerate your thumbnails%2$s.', 'sensei-lms' ), '&lt;a href="' . esc_url( 'http://wordpress.org/extend/plugins/regenerate-thumbnails/' ) . '">', '&lt;/a>' ),
+			'type'        => 'checkbox',
+			'default'     => false,
+			'section'     => 'course-settings',
+		);
+
+		$fields['course_single_image_enable'] = array(
+			'name'        => __( 'Single Course Image', 'sensei-lms' ),
+			'description' => __( 'Output the Course Image on the Single Course Page.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => false,
+			'section'     => 'course-settings',
+		);
+
+		$fields['course_single_image_width'] = array(
+			'name'        => __( 'Image Width - Single', 'sensei-lms' ),
+			'description' => __( 'The width in pixels of the featured image for the Course single post page.', 'sensei-lms' ),
+			'type'        => 'text',
+			'default'     => '100',
+			'section'     => 'course-settings',
+			'required'    => 0,
+		);
+
+		$fields['course_single_image_height'] = array(
+			'name'        => __( 'Image Height - Single', 'sensei-lms' ),
+			'description' => __( 'The height in pixels of the featured image for the Course single post page.', 'sensei-lms' ),
+			'type'        => 'text',
+			'default'     => '100',
+			'section'     => 'course-settings',
+			'required'    => 0,
+		);
+
+		$fields['course_single_image_hard_crop'] = array(
+			'name'        => __( 'Image Hard Crop - Single', 'sensei-lms' ),
+			// translators: Placeholders are an opening and closing &lt;a> tag linking to the documentation page.
+			'description' => sprintf( __( 'After changing this setting, you may need to %1$sregenerate your thumbnails%2$s.', 'sensei-lms' ), '&lt;a href="' . esc_url( 'http://wordpress.org/extend/plugins/regenerate-thumbnails/' ) . '">', '&lt;/a>' ),
+			'type'        => 'checkbox',
+			'default'     => false,
+			'section'     => 'course-settings',
+		);
+
+		$fields['course_archive_featured_enable'] = array(
+			'name'        => __( 'Featured Courses Panel', 'sensei-lms' ),
+			'description' => __( 'Output the Featured Courses Panel on the Course Archive Page.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => true,
+			'section'     => 'course-settings',
+		);
+
+		$fields['course_archive_more_link_text'] = array(
+			'name'        => __( 'More link text', 'sensei-lms' ),
+			'description' => __( 'The text that will be displayed on the Course Archive for the more courses link.', 'sensei-lms' ),
+			'type'        => 'text',
+			'default'     => __( 'More', 'sensei-lms' ),
+			'section'     => 'course-settings',
+			'required'    => 0,
+		);
+
+		// Course Settings.
+		$fields['sensei_learning_mode_all'] = array(
+			'name'        => __( 'Learning Mode', 'sensei-lms' ),
+			'description' => __( 'Show an immersive and distraction-free view for lessons and quizzes.', 'sensei-lms' ),
+			'form'        => 'render_learning_mode_setting',
+			'type'        => 'checkbox',
+			'default'     => \Sensei()->install_version &amp;&amp; version_compare( \Sensei()->install_version, '4.7.0', '>=' ),
+			'section'     => 'appearance-settings',
+		);
+
+		// Course Settings.
+		$fields['sensei_learning_mode_template'] = array(
+			'name'        => __( 'Learning Mode Templates', 'sensei-lms' ),
+			'description' => __( 'Choose a learning mode template that is most suited for your type of content and the style you want to offer to your students.', 'sensei-lms' ),
+			'form'        => 'render_learning_mode_templates',
+			'type'        => 'radio',
+			'default'     => Sensei_Course_Theme_Template_Selection::DEFAULT_TEMPLATE_NAME,
+			'section'     => 'appearance-settings',
+			'options'     => $this->get_learning_mode_template_options(),
+		);
+
+		// Lesson Settings.
+		$fields['lesson_comments'] = array(
+			'name'        => __( 'Allow Comments for Lessons', 'sensei-lms' ),
+			'description' => __( 'This will allow students to post comments on the single Lesson page, only student who have access to the Lesson will be allowed to comment.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => true,
+			'section'     => 'lesson-settings',
+		);
+
+		$fields['lesson_author'] = array(
+			'name'        => __( 'Display Lesson Author', 'sensei-lms' ),
+			'description' => __( 'Output the Lesson Author on Course single page &amp; Lesson archive page.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => true,
+			'section'     => 'lesson-settings',
+		);
+
+		$fields['course_lesson_image_enable'] = array(
+			'name'        => __( 'Course Lesson Images', 'sensei-lms' ),
+			'description' => __( 'Output the Lesson Image on the Single Course Page.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => false,
+			'section'     => 'lesson-settings',
+		);
+
+		$fields['lesson_archive_image_width'] = array(
+			'name'        => __( 'Image Width - Course Lessons', 'sensei-lms' ),
+			'description' => __( 'The width in pixels of the featured image for the Lessons on the Course Single page.', 'sensei-lms' ),
+			'type'        => 'text',
+			'default'     => '100',
+			'section'     => 'lesson-settings',
+			'required'    => 0,
+		);
+
+		$fields['lesson_archive_image_height'] = array(
+			'name'        => __( 'Image Height - Course Lessons', 'sensei-lms' ),
+			'description' => __( 'The height in pixels of the featured image for the Lessons on the Course Single page.', 'sensei-lms' ),
+			'type'        => 'text',
+			'default'     => '100',
+			'section'     => 'lesson-settings',
+			'required'    => 0,
+		);
+
+		$fields['lesson_archive_image_hard_crop'] = array(
+			'name'        => __( 'Image Hard Crop - Course Lessons', 'sensei-lms' ),
+			// translators: Placeholders are an opening and closing &lt;a> tag linking to the documentation page.
+			'description' => sprintf( __( 'After changing this setting, you may need to %1$sregenerate your thumbnails%2$s.', 'sensei-lms' ), '&lt;a href="' . esc_url( 'http://wordpress.org/extend/plugins/regenerate-thumbnails/' ) . '">', '&lt;/a>' ),
+			'type'        => 'checkbox',
+			'default'     => false,
+			'section'     => 'lesson-settings',
+		);
+
+		$fields['lesson_single_image_enable'] = array(
+			'name'        => __( 'Single Lesson Images', 'sensei-lms' ),
+			'description' => __( 'Output the Lesson Image on the Single Lesson Page.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => false,
+			'section'     => 'lesson-settings',
+		);
+
+		$fields['lesson_single_image_width'] = array(
+			'name'        => __( 'Image Width - Single', 'sensei-lms' ),
+			'description' => __( 'The width in pixels of the featured image for the Lessons single post page.', 'sensei-lms' ),
+			'type'        => 'text',
+			'default'     => '100',
+			'section'     => 'lesson-settings',
+			'required'    => 0,
+		);
+
+		$fields['lesson_single_image_height'] = array(
+			'name'        => __( 'Image Height - Single', 'sensei-lms' ),
+			'description' => __( 'The height in pixels of the featured image for the Lessons single post page.', 'sensei-lms' ),
+			'type'        => 'text',
+			'default'     => '100',
+			'section'     => 'lesson-settings',
+			'required'    => 0,
+		);
+
+		$fields['lesson_single_image_hard_crop'] = array(
+			'name'        => __( 'Image Hard Crop - Single', 'sensei-lms' ),
+			// translators: Placeholders are an opening and closing &lt;a> tag linking to the documentation page.
+			'description' => sprintf( __( 'After changing this setting, you may need to %1$sregenerate your thumbnails%2$s.', 'sensei-lms' ), '&lt;a href="' . esc_url( 'http://wordpress.org/extend/plugins/regenerate-thumbnails/' ) . '">', '&lt;/a>' ),
+			'type'        => 'checkbox',
+			'default'     => false,
+			'section'     => 'lesson-settings',
+		);
+
+		// Learner Profile settings
+		/**
+		 * Filters the learner profile URL base.
+		 *
+		 * @hook sensei_learner_profiles_url_base
+		 *
+		 * @param {string} $profile_url_base  The profile URL base, default is 'learner'.
+		 * @return {string} Filtered profile URL base.
+		 */
+		$profile_url_base    = apply_filters( 'sensei_learner_profiles_url_base', __( 'learner', 'sensei-lms' ) );
+		$profile_url_example = trailingslashit( get_home_url() ) . $profile_url_base . '/%username%';
+
+		$fields['learner_profile_enable'] = array(
+			'name'        => __( 'Public student profiles', 'sensei-lms' ),
+			// translators: Placeholder is a profile URL example.
+			'description' => sprintf( __( 'Enable public student profiles that will be accessible to everyone. Profile URL format: %s', 'sensei-lms' ), $profile_url_example ),
+			'type'        => 'checkbox',
+			'default'     => true,
+			'section'     => 'learner-profile-settings',
+		);
+
+		$fields['learner_profile_show_courses'] = array(
+			'name'        => __( 'Show student\'s courses', 'sensei-lms' ),
+			'description' => __( 'Display the student\'s active and completed courses on their profile.', 'sensei-lms' ),
+			'type'        => 'checkbox',
+			'default'     => true,
+			'section'     => 'learner-profile-settings',
+		);
+
+		// Email notifications
+		$learner_email_options = array(
+			'learner-graded-quiz'      => __( 'Their quiz is graded (auto and manual grading)', 'sensei-lms' ),
+			'learner-completed-course' => __( 'They complete a course', 'sensei-lms' ),
+		);
+
+		$teacher_email_options = array(
+			'teacher-started-course'   => __( 'A student starts their course', 'sensei-lms' ),
+			'teacher-completed-course' => __( 'A student completes their course', 'sensei-lms' ),
+			'teacher-completed-lesson' => __( 'A student completes a lesson', 'sensei-lms' ),
+			'teacher-quiz-submitted'   => __( 'A student submits a quiz for grading', 'sensei-lms' ),
+			'teacher-new-message'      => __( 'A student sends a private message to a teacher', 'sensei-lms' ),
+		);
+
+		$global_email_options = array(
+			'new-message-reply' => __( 'They receive a reply to their private message', 'sensei-lms' ),
+		);
+
+		$fields['email_learners'] = array(
+			'name'        => __( 'Emails Sent to Students', 'sensei-lms' ),
+			'description' => __( 'Select the notifications that will be sent to students.', 'sensei-lms' ),
+			'type'        => 'multicheck',
+			'options'     => $learner_email_options,
+			'defaults'    => array( 'learner-graded-quiz', 'learner-completed-course' ),
+			'section'     => 'email-notification-settings',
+		);
+
+		$fields['email_teachers'] = array(
+			'name'        => __( 'Emails Sent to Teachers', 'sensei-lms' ),
+			'description' => __( 'Select the notifications that will be sent to teachers.', 'sensei-lms' ),
+			'type'        => 'multicheck',
+			'options'     => $teacher_email_options,
+			'defaults'    => array( 'teacher-completed-course', 'teacher-started-course', 'teacher-quiz-submitted', 'teacher-new-message' ),
+			'section'     => 'email-notification-settings',
+		);
+
+		$fields['email_global'] = array(
+			'name'        => __( 'Emails Sent to All Users', 'sensei-lms' ),
+			'description' => __( 'Select the notifications that will be sent to all users.', 'sensei-lms' ),
+			'type'        => 'multicheck',
+			'options'     => $global_email_options,
+			'defaults'    => array( 'new-message-reply' ),
+			'section'     => 'email-notification-settings',
+		);
+
+		$fields['email_from_name'] = array(
+			'name'        => __( '"From" Name', 'sensei-lms' ),
+			'description' => __( 'The name from which all emails will be sent.', 'sensei-lms' ),
+			'type'        => 'text',
+			'default'     => get_bloginfo( 'name' ),
+			'section'     => 'email-notification-settings',
+			'required'    => 1,
+		);
+
+		$fields['email_from_address'] = array(
+			'name'        => __( '"From" Address', 'sensei-lms' ),
+			'description' => __( 'The address from which all emails will be sent.', 'sensei-lms' ),
+			'type'        => 'email',
+			'default'     => get_bloginfo( 'admin_email' ),
+			'section'     => 'email-notification-settings',
+			'required'    => 1,
+		);
+
+		$fields['email_reply_to_name'] = [
+			'name'     => __( '"Reply To" Name', 'sensei-lms' ),
+			'type'     => 'input',
+			'default'  => '',
+			'section'  => 'email-notification-settings',
+			'required' => 0,
+		];
+
+		$fields['email_reply_to_address'] = [
+			'name'     => __( '"Reply To" Address', 'sensei-lms' ),
+			'type'     => 'email',
+			'default'  => get_bloginfo( 'admin_email' ),
+			'section'  => 'email-notification-settings',
+			'required' => 0,
+		];
+
+		$fields['email_cc'] = array(
+			'name'          => __( 'CC', 'sensei-lms' ),
+			'description'   => __( 'Enter email addresses to CC on all emails. Separate multiple email addresses with commas.', 'sensei-lms' ),
+			'type'          => 'email',
+			'multiple'      => true,
+			'default'       => '',
+			'section'       => 'email-notification-settings',
+			'required'      => 0,
+			'error_message' => __( 'One or more of the email addresses entered for CC is invalid.', 'sensei-lms' ),
+		);
+
+		$fields['email_bcc'] = array(
+			'name'          => __( 'BCC', 'sensei-lms' ),
+			'description'   => __( 'Enter email addresses to BCC on all emails. Separate multiple email addresses with commas.', 'sensei-lms' ),
+			'type'          => 'email',
+			'multiple'      => true,
+			'default'       => '',
+			'section'       => 'email-notification-settings',
+			'required'      => 0,
+			'error_message' => __( 'One or more of the email addresses entered for BCC is invalid.', 'sensei-lms' ),
+		);
+
+		$fields['email_header_image'] = array(
+			'name'        => __( 'Header Image', 'sensei-lms' ),
+			// translators: Placeholders are opening and closing &lt;a> tags linking to the media uploader.
+			'description' => sprintf( __( 'Enter a URL to an image you want to show in the email\'s header. Upload your image using the %1$smedia uploader%2$s.', 'sensei-lms' ), '&lt;a href="' . admin_url( 'media-new.php' ) . '">', '&lt;/a>' ),
+			'type'        => 'text',
+			'default'     => '',
+			'section'     => 'email-notification-settings',
+			'required'    => 0,
+		);
+
+		$fields['email_footer_text'] = array(
+			'name'        => __( 'Email Footer Text', 'sensei-lms' ),
+			'description' => __( 'The text to appear in the footer of Sensei LMS emails.', 'sensei-lms' ),
+			'type'        => 'textarea',
+			// translators: Placeholder is the blog name.
+			'default'     => sprintf( __( '%1$s - Powered by Sensei LMS', 'sensei-lms' ), get_bloginfo( 'name' ) ),
+			'section'     => 'email-notification-settings',
+			'required'    => 0,
+		);
+
+		$fields['email_base_color'] = array(
+			'name'        => __( 'Base Colour', 'sensei-lms' ),
+			// translators: Placeholders are opening and closing &lt;code> tags.
+			'description' => sprintf( __( 'The base colour for Sensei LMS email templates. Default %1$s#557da1%2$s.', 'sensei-lms' ), '&lt;code>', '&lt;/code>' ),
+			'type'        => 'color',
+			'default'     => '#557da1',
+			'section'     => 'email-notification-settings',
+			'required'    => 1,
+		);
+
+		$fields['email_background_color'] = array(
+			'name'        => __( 'Background Colour', 'sensei-lms' ),
+			// translators: Placeholders are opening and closing &lt;code> tags.
+			'description' => sprintf( __( 'The background colour for Sensei LMS email templates. Default %1$s#f5f5f5%2$s.', 'sensei-lms' ), '&lt;code>', '&lt;/code>' ),
+			'type'        => 'color',
+			'default'     => '#f5f5f5',
+			'section'     => 'email-notification-settings',
+			'required'    => 1,
+		);
+
+		$fields['email_body_background_color'] = array(
+			'name'        => __( 'Body Background Colour', 'sensei-lms' ),
+			// translators: Placeholders are opening and closing &lt;code> tags.
+			'description' => sprintf( __( 'The main body background colour for Sensei LMS email templates. Default %1$s#fdfdfd%2$s.', 'sensei-lms' ), '&lt;code>', '&lt;/code>' ),
+			'type'        => 'color',
+			'default'     => '#fdfdfd',
+			'section'     => 'email-notification-settings',
+			'required'    => 1,
+		);
+
+		$fields['email_text_color'] = array(
+			'name'        => __( 'Body Text Colour', 'sensei-lms' ),
+			// translators: Placeholders are opening and closing &lt;code> tags.
+			'description' => sprintf( __( 'The main body text colour for Sensei LMS email templates. Default %1$s#505050%2$s.', 'sensei-lms' ), '&lt;code>', '&lt;/code>' ),
+			'type'        => 'color',
+			'default'     => '#505050',
+			'section'     => 'email-notification-settings',
+			'required'    => 1,
+		);
+
+		if ( Sensei()->feature_flags->is_enabled( 'experimental_features_ui' ) ) {
+			$fields['experimental_progress_storage']                 = array(
+				'name'        => __( 'High-Performance Progress Storage', 'sensei-lms' ),
+				'description' => __( 'Store the progress of your students in separate tables.', 'sensei-lms' ),
+				'form'        => 'render_progress_storage_feature',
+				'type'        => 'checkbox',
+				'default'     => false,
+				'section'     => 'sensei-experimental-features',
+			);
+			$fields['experimental_progress_storage_synchronization'] = array(
+				'name'        => '',
+				'description' => __( 'Synchronize the student progress between storages.', 'sensei-lms' ),
+				'form'        => 'render_progress_storage_synchronization',
+				'type'        => 'checkbox',
+				'default'     => false,
+				'section'     => 'sensei-experimental-features',
+			);
+			$fields['experimental_progress_storage_repository']      = array(
+				'name'        => '', // ,
+				'description' => __( 'Choose a repository to store the progress and quiz submissions of your students.', 'sensei-lms' ),
+				'form'        => 'render_progress_storage_repositories',
+				'type'        => 'radio',
+				'default'     => Progress_Storage_Settings::COMMENTS_STORAGE,
+				'section'     => 'sensei-experimental-features',
+				'options'     => Progress_Storage_Settings::get_storage_repositories(),
+			);
+		}
+
+		/**
+		 * Filters settings fields.
+		 *
+		 * @hook sensei_settings_fields
+		 *
+		 * @param {array} $fields The array of fields.
+		 * @return {array} Filtered array of fields.
+		 */
+		$this->fields = apply_filters( 'sensei_settings_fields', $fields );
+
+	}
+
+	/**
+	 * Get options for the learning mode templates.
+	 */
+	private function get_learning_mode_template_options() {
+		return Sensei_Course_Theme_Template_Selection::get_templates();
+	}
+
+	/**
+	 * Get options for the duration fields.
+	 *
+	 * @since  1.0.0
+	 * @param  $include_milliseconds (default: true) Whether or not to include milliseconds between 0 and 1.
+	 * @return array Options between 0.1 and 10 seconds.
+	 */
+	private function get_duration_options( $include_milliseconds = true ) {
+		$numbers = array( '1.0', '1.5', '2.0', '2.5', '3.0', '3.5', '4.0', '4.5', '5.0', '5.5', '6.0', '6.5', '7.0', '7.5', '8.0', '8.5', '9.0', '9.5', '10.0' );
+		$options = array();
+
+		if ( true == (bool) $include_milliseconds ) {
+			$milliseconds = array( '0.1', '0.2', '0.3', '0.4', '0.5', '0.6', '0.7', '0.8', '0.9' );
+			foreach ( $milliseconds as $k => $v ) {
+				$options[ $v ] = $v;
+			}
+		} else {
+			$options['0.5'] = '0.5';
+		}
+
+		foreach ( $numbers as $k => $v ) {
+			$options[ $v ] = $v;
+		}
+
+		return $options;
+	}
+
+	/**
+	 * Return an array of pages.
+	 *
+	 * @access private
+	 * @since  1.0.0
+	 * @return array
+	 */
+	private function pages_array() {
+		if ( ! is_admin() ) {
+			return [];
+		}
+
+		// REFACTOR - Transform this into a field type instead.
+		// Setup an array of portfolio gallery terms for a dropdown.
+		$pages_dropdown = wp_dropdown_pages(
+			array(
+				'echo'         => 0,
+				'hierarchical' => 1,
+				'sort_column'  => 'post_title',
+				'sort_order'   => 'ASC',
+			)
+		);
+		$page_items     = array();
+
+		// Quick string hack to make sure we get the pages with the indents.
+		$pages_dropdown = str_replace( "&lt;select class='' name='page_id' id='page_id'>", '', $pages_dropdown );
+		$pages_dropdown = str_replace( '&lt;/select>', '', $pages_dropdown );
+		$pages_split    = explode( '&lt;/option>', $pages_dropdown );
+
+		$page_items[] = __( 'Select a Page:', 'sensei-lms' );
+
+		foreach ( $pages_split as $k => $v ) {
+			$id = '';
+			// Get the ID value.
+			preg_match( '/value="(.*?)"/i', $v, $matches );
+
+			if ( isset( $matches[1] ) ) {
+				$id                = $matches[1];
+				$page_items[ $id ] = trim( wp_strip_all_tags( $v ) );
+			}
+		}
+
+		$pages_array = $page_items;
+
+		return $pages_array;
+	}
+
+	/**
+	 * Flush the rewrite rules after the settings have been updated.
+	 * This is to ensure that the proper permalinks are set up for archive pages.
+	 *
+	 * @since 1.9.0
+	 *
+	 * @deprecated 1.24.0 Use flush_rewrite_rules_on_update instance method instead.
+	 */
+	public static function flush_rewrite_rules() {
+		_deprecated_function( __METHOD__, '1.24.0', 'Use flush_rewrite_rules_on_update instance method instead' );
+
+		$settings = new self();
+		$settings->flush_rewrite_rules_on_update();
+	}
+
+	/**
+	 * Flush the rewrite rules after the settings have been updated.
+	 * This is to ensure that the proper permalinks are set up for archive pages.
+	 *
+	 * @internal
+	 *
+	 * @since 1.24.0
+	 */
+	public function flush_rewrite_rules_on_update() {
+		$nonce_action = $this->token . '-options';
+		$nonce_value  = sanitize_text_field( wp_unslash( $_POST['_wpnonce'] ?? '' ) );
+		if ( ! wp_verify_nonce( $nonce_value, $nonce_action ) ) {
+			return;
+		}
+
+		if ( ! is_admin() || ! current_user_can( 'manage_sensei' ) ) {
+			return;
+		}
+
+		if ( isset( $_POST['option_page'] ) &amp;&amp; 'sensei-settings' === $_POST['option_page']
+			&amp;&amp; isset( $_POST['action'] ) &amp;&amp; 'update' === $_POST['action'] ) {
+
+			Sensei()->initiate_rewrite_rules_flush();
+		}
+	}
+
+	/**
+	 * Logs settings update from the Settings form.
+	 *
+	 * @access private
+	 * @since 2.1.0
+	 *
+	 * @param array $old_value The old settings value.
+	 * @param array $value     The new settings value.
+	 */
+	public function log_settings_update( $old_value, $value ) {
+		// Only process user-initiated settings updates.
+		if ( ! ( 'POST' === $_SERVER['REQUEST_METHOD'] &amp;&amp; ! defined( 'REST_REQUEST' ) &amp;&amp; 'options' === get_current_screen()->id ) ) {
+			return;
+		}
+
+		// Find changed fields.
+		$changed = [];
+		foreach ( $this->fields as $field => $field_config ) {
+			// Handle absent fields.
+			$old_field_value = isset( $old_value[ $field ] ) ? $old_value[ $field ] : '';
+			$new_field_value = isset( $value[ $field ] ) ? $value[ $field ] : '';
+
+			// phpcs:ignore Universal.Operators.StrictComparisons -- Loose comparison is okay for checking for changes.
+			if ( $new_field_value != $old_field_value ) {
+				// Create an array for this section of settings if needed.
+				$section = $field_config['section'];
+				if ( ! isset( $changed[ $section ] ) ) {
+					$changed[ $section ] = [];
+				}
+
+				// Get changed setting values to be logged. In most cases, this
+				// will be an array containing only the name of the field.
+				$changed_values      = $this->get_changed_setting_values(
+					$field,
+					$new_field_value,
+					$old_field_value
+				);
+				$changed[ $section ] = array_merge( $changed[ $section ], $changed_values );
+			}
+		}
+
+		// Log changed sections.
+		foreach ( $changed as $section => $fields ) {
+			if ( empty( $fields ) ) {
+				continue;
+			}
+
+			sensei_log_event(
+				'settings_update',
+				[
+					'view'     => $section,
+					'settings' => implode( ',', $fields ),
+				]
+			);
+		}
+	}
+
+	/**
+	 * Ensure that the experimental features settings are consistent.
+	 *
+	 * @access private
+	 * @since 4.20.0
+	 *
+	 * @param array $value     The new settings value.
+	 * @param array $old_value The old settings value.
+	 * @return array Updated settings value.
+	 */
+	public function before_experimental_features_saved( $value, $old_value ) {
+		if ( ! is_admin() || ! function_exists( 'get_current_screen' ) ) {
+			return $value;
+		}
+
+		$screen = get_current_screen();
+		// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotValidated
+		if ( ! ( 'POST' === $_SERVER['REQUEST_METHOD'] &amp;&amp; ! defined( 'REST_REQUEST' ) &amp;&amp; $screen &amp;&amp; 'options' === $screen->id ) ) {
+			return $value;
+		}
+
+		$old_hpps = (bool) ( $old_value['experimental_progress_storage'] ?? false );
+		$new_hpps = (bool) ( $value['experimental_progress_storage'] ?? false );
+
+		if ( $new_hpps !== $old_hpps ) {
+			if ( $new_hpps ) {
+				// If the feature is being enabled, set the default values for the other settings.
+				$value['experimental_progress_storage_synchronization'] = false;
+				$value['experimental_progress_storage_repository']      = Progress_Storage_Settings::COMMENTS_STORAGE;
+			} else {
+				// If the feature is being disabled, clear the values for the other settings.
+				unset( $value['experimental_progress_storage_repository'] );
+				unset( $value['experimental_progress_storage_synchronization'] );
+			}
+		}
+
+		if ( $new_hpps ) {
+			$sync_enabled = (bool) ( $value['experimental_progress_storage_synchronization'] ?? false );
+			if ( ! $sync_enabled ) {
+				// If the synchronization is disabled, set the default value for the repository setting.
+				$value['experimental_progress_storage_repository'] = Progress_Storage_Settings::COMMENTS_STORAGE;
+			}
+		}
+
+		return $value;
+	}
+
+	/**
+	 * Do preparation when the experimental features setting were saved.
+	 *
+	 * @access private
+	 * @since 4.19.2
+	 *
+	 * @param array $old_value The old settings value.
+	 * @param array $value     The new settings value.
+	 */
+	public function experimental_features_saved( $old_value, $value ) {
+		if ( ! is_admin() || ! function_exists( 'get_current_screen' ) ) {
+			return;
+		}
+
+		$screen = get_current_screen();
+		// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotValidated
+		if ( ! ( 'POST' === $_SERVER['REQUEST_METHOD'] &amp;&amp; ! defined( 'REST_REQUEST' ) &amp;&amp; $screen &amp;&amp; 'options' === $screen->id ) ) {
+			return;
+		}
+
+		$old_hpps = (bool) ( $old_value['experimental_progress_storage'] ?? false );
+		$new_hpps = (bool) ( $value['experimental_progress_storage'] ?? false );
+		if ( $new_hpps !== $old_hpps ) {
+			sensei_log_event(
+				'hpps_status_change',
+				array(
+					'enabled' => $new_hpps,
+				)
+			);
+
+			if ( $new_hpps ) {
+				// Enable the feature flag to make progress tables available.
+				add_filter( 'sensei_feature_flag_tables_based_progress', '__return_true' );
+				( new Schema( Sensei()->feature_flags ) )->create_tables();
+			}
+		}
+
+		// Make sure the migration scheduler is initialized.
+		Sensei()->init_migration_scheduler();
+		$migration_scheduler = Sensei()->migration_scheduler;
+		if ( is_null( $migration_scheduler ) ) {
+			return;
+		}
+
+		$old_sync = (bool) ( $old_value['experimental_progress_storage_synchronization'] ?? false );
+		$new_sync = (bool) ( $value['experimental_progress_storage_synchronization'] ?? false );
+		if ( $new_sync !== $old_sync &amp;&amp; $new_sync ) {
+			// Drop existing tables and clear the migration state.
+			( new Eraser() )->drop_tables();
+			$migration_scheduler->clear_state();
+
+			// Recreate tables and  schedule the migration.
+			( new Schema( Sensei()->feature_flags ) )->create_tables();
+			$migration_scheduler->schedule();
+		}
+
+		$old_repository = $old_value['experimental_progress_storage_repository'] ?? Progress_Storage_Settings::COMMENTS_STORAGE;
+		$new_repository = $value['experimental_progress_storage_repository'] ?? Progress_Storage_Settings::COMMENTS_STORAGE;
+		if ( $new_repository !== $old_repository ) {
+			sensei_log_event(
+				'hpps_repository_change',
+				array(
+					'repository' => $new_repository,
+				)
+			);
+		}
+	}
+
+	/**
+	 * Renders the High-Performance Progress Storage feature setting.
+	 *
+	 * @param array $args The field arguments.
+	 */
+	public function render_progress_storage_feature( $args ) {
+
+		// Checkbox field.
+		$settings = $this->get_settings();
+		$key      = $args['key'];
+		$value    = $settings[ $key ];
+
+		?>
+		&lt;div>
+			&lt;label>
+				&lt;input
+					class="sensei-settings_progress-storage-feature"
+					data-saved-state="&lt;?php echo esc_attr( (int) $value ); ?>"
+					type="checkbox"
+					name="&lt;?php echo esc_attr( "{$this->token}[{$key}]" ); ?>"
+					value="1"
+					&lt;?php checked( $value, true, true ); ?>
+				/>
+				&lt;?php echo esc_html( $args['data']['description'] ); ?>
+			&lt;/label>
+
+		&lt;?php if ( ! $value ) : ?>
+			&lt;div class="notice notice-info inline sensei-settings__progress-storage-settings hidden">
+				&lt;p>
+					&lt;?php
+					echo esc_html( __( 'Save changes to make the feature settings available.', 'sensei-lms' ) );
+					?>
+				&lt;/p>
+			&lt;/div>
+		&lt;?php endif; ?>
+			&lt;h4>&lt;?php esc_html_e( 'Instructions', 'sensei-lms' ); ?>&lt;/h4>
+			&lt;p>&lt;?php esc_html_e( 'To enable High-Performance Progress Storage, follow these steps:', 'sensei-lms' ); ?>&lt;/p>
+			&lt;ol>
+				&lt;li>&lt;?php esc_html_e( 'Select the "Store the progress of your students in separate tables" checkbox and save the changes.', 'sensei-lms' ); ?>&lt;/li>
+				&lt;li>&lt;?php esc_html_e( 'Select the "Synchronize the student progress between storages" checkbox and save the changes.', 'sensei-lms' ); ?>&lt;/li>
+				&lt;li>&lt;?php esc_html_e( 'Wait until the "Migration complete and data synchronization enabled" message is displayed. This may take awhile and you will need to refresh the page to see the updated status.', 'sensei-lms' ); ?>&lt;/li>
+				&lt;li>&lt;?php esc_html_e( 'Select the "High-Performance progress storage (experimental)" option and save the changes.', 'sensei-lms' ); ?>&lt;/li>
+				&lt;li>&lt;?php esc_html_e( 'You are now using High-Performance Progress Storage!', 'sensei-lms' ); ?>&lt;/li>
+			&lt;/ol>
+			&lt;p>&lt;?php echo wp_kses_post( __( 'To learn more about the feature, check the &lt;a href="https://senseilms.com/documentation/high-performance-progress-storage/" target="_blank">docs&lt;/a>.', 'sensei-lms' ) ); ?>&lt;/p>
+		&lt;/div>
+		&lt;?php
+		Sensei()->assets->enqueue( 'sensei-experimental-features-progress-storage', 'js/admin/settings/experimental-features.js', array( 'jquery' ), true );
+	}
+	/**
+	 * Renders the High-Performance Progress Storage repository setting.
+	 *
+	 * @param array $args The field arguments.
+	 */
+	public function render_progress_storage_repositories( $args ) {
+
+		$settings             = $this->get_settings();
+		$key                  = $args['key'];
+		$value                = $settings[ $key ];
+		$visible              = $settings['experimental_progress_storage'] ?? false;
+		$block_display        = $visible ? 'block' : 'none';
+		$sync_disabled        = ! (bool) ( $settings['experimental_progress_storage_synchronization'] ?? false );
+		$migration_scheduler  = Sensei()->migration_scheduler;
+		$migration_incomplete = ! $migration_scheduler || ! $migration_scheduler->is_complete();
+		?>
+		&lt;div class="sensei-settings__progress-storage-settings" style="display: &lt;?php echo esc_attr( $block_display ); ?>">
+			&lt;h4>&lt;?php echo esc_html( __( 'Progress storage repository', 'sensei-lms' ) ); ?>&lt;/h4>
+			&lt;p>&lt;?php echo esc_html( $args['data']['description'] ); ?>&lt;/p>
+			&lt;ul>
+				&lt;?php foreach ( $args['data']['options'] as $option_value => $option_name ) : ?>
+				&lt;li>
+					&lt;label>
+						&lt;input
+							class="sensei-settings_progress-storage-repository"
+							type="radio"
+							name="&lt;?php echo esc_attr( "{$this->token}[{$key}]" ); ?>"
+							value="&lt;?php echo esc_attr( $option_value ); ?>"
+							&lt;?php disabled( $sync_disabled || $migration_incomplete ); ?>
+							&lt;?php checked( $option_value, $value, true ); ?>
+						/>
+						&lt;?php echo esc_html( $option_name ); ?>
+					&lt;/label>
+				&lt;/li>
+				&lt;?php endforeach; ?>
+			&lt;/ul>
+
+			&lt;?php if ( $sync_disabled ) : ?>
+			&lt;p>
+				&lt;?php
+				echo esc_html( __( 'Enable storage synchronization and wait for full synchronization to complete before switching to another repository.', 'sensei-lms' ) );
+				?>
+			&lt;/p>
+			&lt;?php endif; ?>
+
+			&lt;?php if ( ! $sync_disabled &amp;&amp; $migration_incomplete ) : ?>
+			&lt;p>
+				&lt;?php
+				echo esc_html( __( 'Wait for full synchronization to complete before switching to another repository.', 'sensei-lms' ) );
+				?>
+			&lt;/p>
+			&lt;?php endif; ?>
+
+		&lt;/div>
+		&lt;?php
+	}
+
+	/**
+	 * Renders the High-Performance Progress Storage synchronization setting.
+	 *
+	 * @param array $args The field arguments.
+	 */
+	public function render_progress_storage_synchronization( $args ) {
+
+		// Checkbox field.
+		$settings = $this->get_settings();
+		$key      = $args['key'];
+		$value    = $settings[ $key ];
+
+		// Setting visibility.
+		$visible       = $settings['experimental_progress_storage'] ?? false;
+		$block_display = $visible ? 'block' : 'none';
+
+		// Migration state.
+		$migration_scheduler   = Sensei()->migration_scheduler;
+		$migration_in_progress = $migration_scheduler &amp;&amp; $migration_scheduler->is_in_progress();
+		$migration_complete    = $migration_scheduler &amp;&amp; $migration_scheduler->is_complete();
+		$migration_failed      = $migration_scheduler &amp;&amp; $migration_scheduler->is_failed();
+		$migration_errors      = ! is_null( $migration_scheduler ) ? $migration_scheduler->get_errors() : array();
+
+		// Disables the checkbox if the migration is in progress or HPPS storage is in use.
+		$hpps_repository_in_use = Progress_Storage_Settings::TABLES_STORAGE === ( $settings['experimental_progress_storage_repository'] ?? null );
+		$disabled               = ! $visible || $migration_in_progress || $hpps_repository_in_use || is_null( Sensei()->action_scheduler );
+		if ( $migration_errors ) {
+			// Enable the checkbox if there are errors to allow the user to retry.
+			$disabled = false;
+		}
+		?>
+		&lt;div class="sensei-settings__progress-storage-settings" style="display: &lt;?php echo esc_attr( $block_display ); ?>">
+			&lt;h4>&lt;?php echo esc_html( __( 'Progress storage synchronization', 'sensei-lms' ) ); ?>&lt;/h4>
+			&lt;label>
+				&lt;input
+					class="sensei-settings_progress-storage-synchronization"
+					data-saved-state="&lt;?php echo esc_attr( (int) ( $value &amp;&amp; $migration_complete ) ); ?>"
+					type="checkbox"
+					name="&lt;?php echo esc_attr( "{$this->token}[{$key}]" ); ?>"
+					value="1"
+					&lt;?php disabled( true, $disabled, true ); ?>
+					&lt;?php checked( $value, true, true ); ?>
+				/>
+				&lt;?php echo esc_html( $args['data']['description'] ); ?>
+			&lt;/label>
+
+			&lt;?php if ( $disabled ) : ?>
+				&lt;input type="hidden" name="&lt;?php echo esc_attr( "{$this->token}[{$key}]" ); ?>" value="&lt;?php echo esc_attr( $value ); ?>" />
+			&lt;?php endif; ?>
+
+			&lt;?php if ( $value ) : ?>
+				&lt;?php if ( $migration_in_progress ) : ?>
+				&lt;p>
+					&lt;?php
+					echo esc_html( __( 'Data migration is in progress. Please wait for it to switch repository.', 'sensei-lms' ) );
+					?>
+				&lt;/p>
+				&lt;?php elseif ( $migration_complete &amp;&amp; empty( $migration_errors ) ) : ?>
+				&lt;p>
+					&lt;?php
+					echo esc_html( __( 'Migration complete and data synchronization enabled.', 'sensei-lms' ) );
+					?>
+				&lt;/p>
+				&lt;?php elseif ( $migration_complete &amp;&amp; ! empty( $migration_errors ) ) : ?>
+				&lt;p>
+					&lt;?php
+					echo esc_html( __( 'Migration complete, but errors occurred during data synchronization.', 'sensei-lms' ) );
+					?>
+				&lt;/p>
+				&lt;?php elseif ( $migration_failed ) : ?>
+				&lt;p>
+					&lt;?php
+					echo esc_html( __( 'Migration failed. Please retry.', 'sensei-lms' ) );
+					?>
+				&lt;/p>
+				&lt;?php elseif ( is_null( $migration_scheduler ) ) : ?>
+				&lt;p>
+					&lt;?php
+					echo esc_html( __( 'Cannot get the migration status.', 'sensei-lms' ) );
+					?>
+				&lt;?php else : ?>
+				&lt;p>
+					&lt;?php
+					echo esc_html( __( 'Waiting for data migration to start.', 'sensei-lms' ) );
+					?>
+				&lt;/p>
+				&lt;?php endif; ?>
+
+				&lt;?php if ( ! empty( $migration_errors ) ) : ?>
+				&lt;p>
+					&lt;?php
+					echo esc_html( __( 'Errors occurred during migration:', 'sensei-lms' ) );
+					?>
+				&lt;/p>
+				&lt;ul class="ul-disc">
+					&lt;?php foreach ( $migration_errors as $error ) : ?>
+					&lt;li>&lt;?php echo esc_html( $error ); ?>&lt;/li>
+					&lt;?php endforeach; ?>
+				&lt;/ul>
+				&lt;?php endif; ?>
+			&lt;?php endif; ?>
+		&lt;/div>
+		&lt;?php
+	}
+
+	/**
+	 * Get an array of setting values which were changed. In most cases, this
+	 * will simply be the name of the setting. However, if the setting is an
+	 * array of strings, then this will return an array of the string values
+	 * that were changed. These values returned will be of the form
+	 * "field_name[value_name]".
+	 *
+	 * @since 2.1.0
+	 *
+	 * @param string $field     The name of the setting field.
+	 * @param array  $new_value The new value.
+	 * @param array  $old_value The old value.
+	 *
+	 * @return array The array of strings representing the field that was
+	 *               changed, or an array containing the field name.
+	 */
+	private function get_changed_setting_values( $field, $new_value, $old_value ) {
+		// If the old and new values are not arrays, return the field name.
+		if ( ! is_array( $new_value ) || ! is_array( $old_value ) ) {
+			return [ $field ];
+		}
+
+		// Now, make sure they are both string arrays.
+		foreach ( array_merge( $new_value, $old_value ) as $value ) {
+			if ( ! is_string( $value ) ) {
+				return [ $field ];
+			}
+		}
+
+		// We have two string arrays. Return the difference in their values.
+		$added   = array_diff( $new_value, $old_value );
+		$removed = array_diff( $old_value, $new_value );
+
+		return array_filter( array_merge( $added, $removed ) );
+	}
+
+	/**
+	 * Learning mode setting.
+	 *
+	 * @param array $args The field arguments.
+	 */
+	public function render_learning_mode_setting( $args ) {
+		$options = $this->get_settings();
+		$key     = $args['key'];
+		$value   = $options[ $key ];
+
+		?>
+		&lt;label for="&lt;?php echo esc_attr( $key ); ?>">
+			&lt;input id="&lt;?php echo esc_attr( $key ); ?>" name="&lt;?php echo esc_attr( "{$this->token}[{$key}]" ); ?>" type="checkbox" value="1" &lt;?php checked( $value, '1' ); ?> />
+			&lt;?php esc_html_e( 'Enable for all courses', 'sensei-lms' ); ?>
+		&lt;/label>
+		&lt;p>
+			&lt;span class="description">&lt;?php echo esc_html( $args['data']['description'] ); ?>&lt;/span>
+		&lt;/p>
+
+		&lt;?php
+	}
+
+	/**
+	 * Renders the Learning Mode template selection setting.
+	 *
+	 * @param array $args The field arguments.
+	 */
+	public function render_learning_mode_templates( $args ) {
+		$settings = $this->get_settings();
+		$key      = $args['key'];
+		$value    = $settings[ $key ];
+		?>
+			&lt;p> &lt;?php echo esc_html( $args['data']['description'] ); ?>&lt;/p>
+			&lt;ul class="sensei-lm-block-template__options" id="sensei-lm-block-template__options">
+			&lt;?php foreach ( $args['data']['options'] as $template ) : ?>
+				&lt;?php
+					$upsell   = isset( $template->upsell ) ? $template->upsell : false;
+					$title    = isset( $template->title ) || empty( $template->title ) ? $template->title : $template->name;
+					$disabled = (bool) $upsell;
+				?>
+				&lt;li class="sensei-lm-block-template__option">
+					&lt;label class="sensei-lm-block-template__option-label">
+						&lt;div class="sensei-lm-block-template__option-header">
+							&lt;input
+								type="radio"
+								name="&lt;?php echo esc_attr( "{$this->token}[{$key}]" ); ?>"
+								value="&lt;?php echo esc_attr( $template->name ); ?>"
+								&lt;?php disabled( true, $disabled, true ); ?>
+								&lt;?php checked( $template->name, $value, true ); ?>
+							/>
+							&lt;h4 class="sensei-lm-block-template__option-title &lt;?php echo $disabled ? 'sensei-lm-block-template__option-title--disabled' : ''; ?>">
+								&lt;?php echo esc_html( $title ); ?>
+							&lt;/h4>
+							&lt;?php if ( $disabled ) : ?>
+								&lt;a href="&lt;?php echo esc_attr( $upsell['url'] ); ?>" target="_blank" rel="noopener">
+									&lt;?php echo esc_attr( $upsell['title'] ); ?>
+								&lt;/a>
+							&lt;?php endif; ?>
+						&lt;/div>
+
+						&lt;img alt="&lt;?php esc_attr( $template->title ); ?>" src="&lt;?php echo esc_attr( $template->screenshots['thumbnail'] ); ?>" />
+					&lt;/label>
+				&lt;/li>
+			&lt;?php endforeach; ?>
+			&lt;/ul>
+		&lt;?php
+
+		$inline_data = [
+			'name'         => "{$this->token}[{$key}]",
+			'value'        => $value,
+			'options'      => $args['data']['options'],
+			'customizeUrl' => Sensei_Course_Theme::get_learning_mode_fse_url(),
+			'formId'       => "{$this->token}-form",
+			'section'      => $args['data']['section'],
+		];
+		Sensei()->assets->enqueue( 'learning-mode-templates-styles', 'course-theme/learning-mode-templates/styles.css', [ 'wp-components' ] );
+		Sensei()->assets->enqueue( 'learning-mode-templates-script', 'course-theme/learning-mode-templates/index.js', [ 'wp-element', 'wp-components' ], true );
+		wp_add_inline_script(
+			'learning-mode-templates-script',
+			sprintf( 'window.sensei = window.sensei || {}; window.sensei.learningModeTemplateSetting = %s;', wp_json_encode( $inline_data ) ),
+			'before'
+		);
+	}
+
+	/**
+	 * Enqueue javascript.
+	 */
+	public function enqueue_scripts() {
+		parent::enqueue_scripts();
+
+		// Generate nonce for marking section visited action.
+		wp_add_inline_script(
+			'sensei-settings',
+			'window.senseiSettingsSectionVisitNonce  = "' . wp_create_nonce( 'sensei-mark-settings-section-visited' ) . '";',
+			'before'
+		);
+	}
+
+	/**
+	 * Marks the given section as visited.
+	 */
+	public function mark_section_as_visited() {
+		if ( isset( $_POST['nonce'] ) &amp;&amp; wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['nonce'] ) ), 'sensei-mark-settings-section-visited' ) ) {
+			if ( isset( $_POST['section_id'] ) ) {
+				$section_id = sanitize_key( $_POST['section_id'] );
+				$visited    = get_option( self::VISITED_SECTIONS_OPTION_KEY, [] );
+
+				if ( ! in_array( $section_id, $visited, true ) ) {
+					$visited[] = $section_id;
+					update_option( self::VISITED_SECTIONS_OPTION_KEY, $visited );
+
+					if ( 'appearance-settings' === $section_id ) {
+						sensei_log_event( 'home_task_complete', [ 'type' => Sensei_Home_Task_Configure_Learning_Mode::get_id() ] );
+					}
+				}
+			}
+		}
+	}
+}
+
+/**
+ * Class WooThemes_Sensei_Settings
+ *
+ * @ignore only for backward compatibility
+ * @since 1.9.0
+ */
+class WooThemes_Sensei_Settings extends Sensei_Settings{}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+
+	<footer>
+		<a href="https://senseilms.com/">SenseiLMS.com</a> &bull;
+		<a href="https://github.com/automattic/sensei">Sensei LMS on GitHub</a>
+	</footer>
+
+
+</div>
+
+<nav>
+	<h2><a href="index.html">Home</a></h2><h3>Actions</h3><ul><li><a href="analysis_after_container.html">analysis_after_container</a></li><li><a href="analysis_before_container.html">analysis_before_container</a></li><li><a href="analysis_wrapper_container.html">analysis_wrapper_container</a></li><li><a href="grading_after_container.html">grading_after_container</a></li><li><a href="grading_before_container.html">grading_before_container</a></li><li><a href="grading_wrapper_container.html">grading_wrapper_container</a></li><li><a href="learners_after_container.html">learners_after_container</a></li><li><a href="learners_before_container.html">learners_before_container</a></li><li><a href="learners_wrapper_container.html">learners_wrapper_container</a></li><li><a href="sensei_additional_scripts.html">sensei_additional_scripts</a></li><li><a href="sensei_additional_styles.html">sensei_additional_styles</a></li><li><a href="sensei_admin_enrol_user.html">sensei_admin_enrol_user</a></li><li><a href="sensei_after_active_user_courses.html">sensei_after_active_user_courses</a></li><li><a href="sensei_after_completed_user_courses.html">sensei_after_completed_user_courses</a></li><li><a href="sensei_after_email_content.html">sensei_after_email_content</a></li><li><a href="sensei_after_email_template.html">sensei_after_email_template</a></li><li><a href="sensei_after_learner_course_content.html">sensei_after_learner_course_content</a></li><li><a href="sensei_after_list_table.html">sensei_after_list_table</a></li><li><a href="sensei_after_main_content.html">sensei_after_main_content</a></li><li><a href="sensei_after_sending_email.html">sensei_after_sending_email</a></li><li><a href="sensei_after_template_part.html">sensei_after_template_part</a></li><li><a href="sensei_after_user_course_content.html">sensei_after_user_course_content</a></li><li><a href="sensei_after_user_courses.html">sensei_after_user_courses</a></li><li><a href="sensei_analysis_after_headers.html">sensei_analysis_after_headers</a></li><li><a href="sensei_analysis_extra.html">sensei_analysis_extra</a></li><li><a href="sensei_archive_after_course_loop.html">sensei_archive_after_course_loop</a></li><li><a href="sensei_archive_after_lesson_loop.html">sensei_archive_after_lesson_loop</a></li><li><a href="sensei_archive_after_message_loop.html">sensei_archive_after_message_loop</a></li><li><a href="sensei_archive_before_course_loop.html">sensei_archive_before_course_loop</a></li><li><a href="sensei_archive_before_lesson_loop.html">sensei_archive_before_lesson_loop</a></li><li><a href="sensei_archive_before_message_loop.html">sensei_archive_before_message_loop</a></li><li><a href="sensei_before_active_user_courses.html">sensei_before_active_user_courses</a></li><li><a href="sensei_before_completed_user_courses.html">sensei_before_completed_user_courses</a></li><li><a href="sensei_before_email_content.html">sensei_before_email_content</a></li><li><a href="sensei_before_email_template.html">sensei_before_email_template</a></li><li><a href="sensei_before_learner_course_content.html">sensei_before_learner_course_content</a></li><li><a href="sensei_before_learners_enrolled_courses_query.html">sensei_before_learners_enrolled_courses_query</a></li><li><a href="sensei_before_list_table.html">sensei_before_list_table</a></li><li><a href="sensei_before_mail.html">sensei_before_mail</a></li><li><a href="sensei_before_main_content.html">sensei_before_main_content</a></li><li><a href="sensei_before_my_courses.html">sensei_before_my_courses</a></li><li><a href="sensei_before_template_part.html">sensei_before_template_part</a></li><li><a href="sensei_before_user_course_content.html">sensei_before_user_course_content</a></li><li><a href="sensei_before_user_courses.html">sensei_before_user_courses</a></li><li><a href="sensei_complete_course.html">sensei_complete_course</a></li><li><a href="sensei_complete_lesson.html">sensei_complete_lesson</a></li><li><a href="sensei_complete_lesson_button.html">sensei_complete_lesson_button</a></li><li><a href="sensei_content_lesson_after.html">sensei_content_lesson_after</a></li><li><a href="sensei_content_lesson_before.html">sensei_content_lesson_before</a></li><li><a href="sensei_content_lesson_inside_after.html">sensei_content_lesson_inside_after</a></li><li><a href="sensei_content_lesson_inside_before.html">sensei_content_lesson_inside_before</a></li><li><a href="sensei_content_message_before.html">sensei_content_message_before</a></li><li><a href="sensei_content_message_inside_after.html">sensei_content_message_inside_after</a></li><li><a href="sensei_content_message_inside_before.html">sensei_content_message_inside_before</a></li><li><a href="sensei_course_archive_meta.html">sensei_course_archive_meta</a></li><li><a href="sensei_course_content_after.html">sensei_course_content_after</a></li><li><a href="sensei_course_content_before.html">sensei_course_content_before</a></li><li><a href="sensei_course_content_inside_after.html">sensei_course_content_inside_after</a></li><li><a href="sensei_course_content_inside_before.html">sensei_course_content_inside_before</a></li><li><a href="sensei_course_enrolment_status_changed.html">sensei_course_enrolment_status_changed</a></li><li><a href="sensei_course_learning_mode_load_override_styles.html">sensei_course_learning_mode_load_override_styles</a></li><li><a href="sensei_course_learning_mode_load_theme.html">sensei_course_learning_mode_load_theme</a></li><li><a href="sensei_course_learning_mode_override_theme.html">sensei_course_learning_mode_override_theme</a></li><li><a href="sensei_course_meta_before_save.html">sensei_course_meta_before_save</a></li><li><a href="sensei_course_meta_inside_after.html">sensei_course_meta_inside_after</a></li><li><a href="sensei_course_meta_inside_before.html">sensei_course_meta_inside_before</a></li><li><a href="sensei_course_new_teacher_assigned.html">sensei_course_new_teacher_assigned</a></li><li><a href="sensei_course_results_after_lessons.html">sensei_course_results_after_lessons</a></li><li><a href="sensei_course_results_before_lessons.html">sensei_course_results_before_lessons</a></li><li><a href="sensei_course_results_content_after.html">sensei_course_results_content_after</a></li><li><a href="sensei_course_results_content_before.html">sensei_course_results_content_before</a></li><li><a href="sensei_course_results_content_inside_after.html">sensei_course_results_content_inside_after</a></li><li><a href="sensei_course_results_content_inside_before.html">sensei_course_results_content_inside_before</a></li><li><a href="sensei_course_results_content_inside_before_lessons.html">sensei_course_results_content_inside_before_lessons</a></li><li><a href="sensei_course_status_updated.html">sensei_course_status_updated</a></li><li><a href="sensei_course_structure_lesson_created.html">sensei_course_structure_lesson_created</a></li><li><a href="sensei_course_structure_quiz_created.html">sensei_course_structure_quiz_created</a></li><li><a href="sensei_data_port_complete.html">sensei_data_port_complete</a></li><li><a href="sensei_disable_legacy_emails.html">sensei_disable_legacy_emails</a></li><li><a href="sensei_email_mailpoet_sync_subscribers.html">sensei_email_mailpoet_sync_subscribers</a></li><li><a href="sensei_email_send.html">sensei_email_send</a></li><li><a href="sensei_emails.html">sensei_emails</a></li><li><a href="sensei_enrolment_results_calculated.html">sensei_enrolment_results_calculated</a></li><li><a href="sensei_frontend_messages.html">sensei_frontend_messages</a></li><li><a href="sensei_grading_after_headers.html">sensei_grading_after_headers</a></li><li><a href="sensei_grading_before_dropdown_filters.html">sensei_grading_before_dropdown_filters</a></li><li><a href="sensei_grading_extra.html">sensei_grading_extra</a></li><li><a href="sensei_learner_admin_after_container.html">sensei_learner_admin_after_container</a></li><li><a href="sensei_learner_admin_before_container.html">sensei_learner_admin_before_container</a></li><li><a href="sensei_learner_admin_extra.html">sensei_learner_admin_extra</a></li><li><a href="sensei_learner_admin_wrapper_container.html">sensei_learner_admin_wrapper_container</a></li><li><a href="sensei_learner_profile_content_after.html">sensei_learner_profile_content_after</a></li><li><a href="sensei_learner_profile_content_before.html">sensei_learner_profile_content_before</a></li><li><a href="sensei_learner_profile_info.html">sensei_learner_profile_info</a></li><li><a href="sensei_learner_profile_inside_content_after.html">sensei_learner_profile_inside_content_after</a></li><li><a href="sensei_learner_profile_inside_content_before.html">sensei_learner_profile_inside_content_before</a></li><li><a href="sensei_learners_add_learner_form.html">sensei_learners_add_learner_form</a></li><li><a href="sensei_learners_after_headers.html">sensei_learners_after_headers</a></li><li><a href="sensei_learners_before_dropdown_filters.html">sensei_learners_before_dropdown_filters</a></li><li><a href="sensei_learners_extra.html">sensei_learners_extra</a></li><li><a href="sensei_lesson_back_link.html">sensei_lesson_back_link</a></li><li><a href="sensei_lesson_meta_extra.html">sensei_lesson_meta_extra</a></li><li><a href="sensei_lesson_status_updated.html">sensei_lesson_status_updated</a></li><li><a href="sensei_lesson_video.html">sensei_lesson_video</a></li><li><a href="sensei_lms_installed.html">sensei_lms_installed</a></li><li><a href="sensei_loaded.html">sensei_loaded</a></li><li><a href="sensei_log_activity_after.html">sensei_log_activity_after</a></li><li><a href="sensei_log_activity_before.html">sensei_log_activity_before</a></li><li><a href="sensei_login_form_after.html">sensei_login_form_after</a></li><li><a href="sensei_login_form_before.html">sensei_login_form_before</a></li><li><a href="sensei_login_form_inside_after.html">sensei_login_form_inside_after</a></li><li><a href="sensei_login_form_inside_after_password_field.html">sensei_login_form_inside_after_password_field</a></li><li><a href="sensei_login_form_inside_before.html">sensei_login_form_inside_before</a></li><li><a href="sensei_loop_course_after.html">sensei_loop_course_after</a></li><li><a href="sensei_loop_course_before.html">sensei_loop_course_before</a></li><li><a href="sensei_loop_course_inside_after.html">sensei_loop_course_inside_after</a></li><li><a href="sensei_loop_course_inside_before.html">sensei_loop_course_inside_before</a></li><li><a href="sensei_loop_lesson_after.html">sensei_loop_lesson_after</a></li><li><a href="sensei_loop_lesson_before.html">sensei_loop_lesson_before</a></li><li><a href="sensei_loop_lesson_inside_after.html">sensei_loop_lesson_inside_after</a></li><li><a href="sensei_loop_lesson_inside_before.html">sensei_loop_lesson_inside_before</a></li><li><a href="sensei_loop_message_after.html">sensei_loop_message_after</a></li><li><a href="sensei_loop_message_before.html">sensei_loop_message_before</a></li><li><a href="sensei_loop_message_inside_after.html">sensei_loop_message_inside_after</a></li><li><a href="sensei_loop_message_inside_before.html">sensei_loop_message_inside_before</a></li><li><a href="sensei_manual_enrolment_learner_enrolled.html">sensei_manual_enrolment_learner_enrolled</a></li><li><a href="sensei_manual_enrolment_learner_withdrawn.html">sensei_manual_enrolment_learner_withdrawn</a></li><li><a href="sensei_module_save_user_progress.html">sensei_module_save_user_progress</a></li><li><a href="sensei_my_courses_after.html">sensei_my_courses_after</a></li><li><a href="sensei_my_courses_before.html">sensei_my_courses_before</a></li><li><a href="sensei_my_courses_content_inside_after.html">sensei_my_courses_content_inside_after</a></li><li><a href="sensei_my_courses_content_inside_before.html">sensei_my_courses_content_inside_before</a></li><li><a href="sensei_new_private_message.html">sensei_new_private_message</a></li><li><a href="sensei_output_course_enrolment_actions.html">sensei_output_course_enrolment_actions</a></li><li><a href="sensei_pagination.html">sensei_pagination</a></li><li><a href="sensei_private_message_reply.html">sensei_private_message_reply</a></li><li><a href="sensei_pro_groups_menu_item.html">sensei_pro_groups_menu_item</a></li><li><a href="sensei_quiz_back_link.html">sensei_quiz_back_link</a></li><li><a href="sensei_quiz_create.html">sensei_quiz_create</a></li><li><a href="sensei_quiz_question_answers_inside_after.html">sensei_quiz_question_answers_inside_after</a></li><li><a href="sensei_quiz_question_answers_inside_before.html">sensei_quiz_question_answers_inside_before</a></li><li><a href="sensei_quiz_question_inside_after.html">sensei_quiz_question_inside_after</a></li><li><a href="sensei_quiz_question_inside_before.html">sensei_quiz_question_inside_before</a></li><li><a href="sensei_register_form_end.html">sensei_register_form_end</a></li><li><a href="sensei_register_form_fields.html">sensei_register_form_fields</a></li><li><a href="sensei_register_form_start.html">sensei_register_form_start</a></li><li><a href="sensei_register_widgets.html">sensei_register_widgets</a></li><li><a href="sensei_reports_overview_after_top_filters.html">sensei_reports_overview_after_top_filters</a></li><li><a href="sensei_reports_overview_before_top_filters.html">sensei_reports_overview_before_top_filters</a></li><li><a href="sensei_reports_overview_students_data_provider_pre_user_query.html">sensei_reports_overview_students_data_provider_pre_user_query</a></li><li><a href="sensei_reset_lesson_button.html">sensei_reset_lesson_button</a></li><li><a href="sensei_rest_api_category_question_saved.html">sensei_rest_api_category_question_saved</a></li><li><a href="sensei_rest_api_lesson_quiz_update.html">sensei_rest_api_lesson_quiz_update</a></li><li><a href="sensei_rest_api_question_saved.html">sensei_rest_api_question_saved</a></li><li><a href="sensei_settings_after_links.html">sensei_settings_after_links</a></li><li><a href="sensei_sidebar.html">sensei_sidebar</a></li><li><a href="sensei_single_course_content_inside_after.html">sensei_single_course_content_inside_after</a></li><li><a href="sensei_single_course_content_inside_before.html">sensei_single_course_content_inside_before</a></li><li><a href="sensei_single_course_inside_after_lesson.html">sensei_single_course_inside_after_lesson</a></li><li><a href="sensei_single_course_inside_before_lesson.html">sensei_single_course_inside_before_lesson</a></li><li><a href="sensei_single_course_lessons_after.html">sensei_single_course_lessons_after</a></li><li><a href="sensei_single_course_lessons_before.html">sensei_single_course_lessons_before</a></li><li><a href="sensei_single_course_modules_after.html">sensei_single_course_modules_after</a></li><li><a href="sensei_single_course_modules_before.html">sensei_single_course_modules_before</a></li><li><a href="sensei_single_course_modules_inside_after.html">sensei_single_course_modules_inside_after</a></li><li><a href="sensei_single_course_modules_inside_before.html">sensei_single_course_modules_inside_before</a></li><li><a href="sensei_single_lesson_content_inside_after.html">sensei_single_lesson_content_inside_after</a></li><li><a href="sensei_single_lesson_content_inside_before.html">sensei_single_lesson_content_inside_before</a></li><li><a href="sensei_single_message_content_inside_after.html">sensei_single_message_content_inside_after</a></li><li><a href="sensei_single_message_content_inside_before.html">sensei_single_message_content_inside_before</a></li><li><a href="sensei_single_quiz_content_inside_after.html">sensei_single_quiz_content_inside_after</a></li><li><a href="sensei_single_quiz_content_inside_before.html">sensei_single_quiz_content_inside_before</a></li><li><a href="sensei_single_quiz_questions_after.html">sensei_single_quiz_questions_after</a></li><li><a href="sensei_single_quiz_questions_before.html">sensei_single_quiz_questions_before</a></li><li><a href="sensei_taxonomy_module_content_after.html">sensei_taxonomy_module_content_after</a></li><li><a href="sensei_taxonomy_module_content_before.html">sensei_taxonomy_module_content_before</a></li><li><a href="sensei_taxonomy_module_content_inside_after.html">sensei_taxonomy_module_content_inside_after</a></li><li><a href="sensei_taxonomy_module_content_inside_before.html">sensei_taxonomy_module_content_inside_before</a></li><li><a href="sensei_teacher_archive_course_loop_after.html">sensei_teacher_archive_course_loop_after</a></li><li><a href="sensei_teacher_archive_course_loop_before.html">sensei_teacher_archive_course_loop_before</a></li><li><a href="sensei_tools_listing_after_%257B$tool_id%257D.html">sensei_tools_listing_after_{$tool_id}</a></li><li><a href="sensei_tools_progress_tables_deleted.html">sensei_tools_progress_tables_deleted</a></li><li><a href="sensei_user_course_end.html">sensei_user_course_end</a></li><li><a href="sensei_user_course_reset.html">sensei_user_course_reset</a></li><li><a href="sensei_user_course_start.html">sensei_user_course_start</a></li><li><a href="sensei_user_lesson_end.html">sensei_user_lesson_end</a></li><li><a href="sensei_user_lesson_reset.html">sensei_user_lesson_reset</a></li><li><a href="sensei_user_lesson_start.html">sensei_user_lesson_start</a></li><li><a href="sensei_user_quiz_grade.html">sensei_user_quiz_grade</a></li><li><a href="sensei_user_quiz_submitted.html">sensei_user_quiz_submitted</a></li><li><a href="sensei_utils_check_for_activity_after_get_comments.html">sensei_utils_check_for_activity_after_get_comments</a></li><li><a href="sensei_utils_check_for_activity_before_get_comments.html">sensei_utils_check_for_activity_before_get_comments</a></li><li><a href="sensei_%257B$post_type%257D_initial_publish.html">sensei_{$post_type}_initial_publish</a></li><li><a href="settings_after_form.html">settings_after_form</a></li><li><a href="settings_before_form.html">settings_before_form</a></li><li><a href="wpml_restore_language_from_email.html">wpml_restore_language_from_email</a></li><li><a href="wpml_switch_language_for_email.html">wpml_switch_language_for_email</a></li></ul><h3>Filters</h3><ul><li><a href="sensei_add_comment_indexes.html">sensei_add_comment_indexes</a></li><li><a href="sensei_admin_notices.html">sensei_admin_notices</a></li><li><a href="sensei_analysis_course_columns.html">sensei_analysis_course_columns</a></li><li><a href="sensei_analysis_course_columns_sortable.html">sensei_analysis_course_columns_sortable</a></li><li><a href="sensei_analysis_course_completions.html">sensei_analysis_course_completions</a></li><li><a href="sensei_analysis_course_filter_lessons.html">sensei_analysis_course_filter_lessons</a></li><li><a href="sensei_analysis_course_filter_statuses.html">sensei_analysis_course_filter_statuses</a></li><li><a href="sensei_analysis_course_no_items_text.html">sensei_analysis_course_no_items_text</a></li><li><a href="sensei_analysis_course_percentage.html">sensei_analysis_course_percentage</a></li><li><a href="sensei_analysis_course_search_users.html">sensei_analysis_course_search_users</a></li><li><a href="sensei_analysis_course_sub_menu.html">sensei_analysis_course_sub_menu</a></li><li><a href="sensei_analysis_course_user_lesson.html">sensei_analysis_course_user_lesson</a></li><li><a href="sensei_analysis_course_%257Bview%257D_columns.html">sensei_analysis_course_{view}_columns</a></li><li><a href="sensei_analysis_course_%257Bview%257D_columns_sortable.html">sensei_analysis_course_{view}_columns_sortable</a></li><li><a href="sensei_analysis_lesson_columns.html">sensei_analysis_lesson_columns</a></li><li><a href="sensei_analysis_lesson_columns_sortable.html">sensei_analysis_lesson_columns_sortable</a></li><li><a href="sensei_analysis_lesson_completions.html">sensei_analysis_lesson_completions</a></li><li><a href="sensei_analysis_lesson_filter_statuses.html">sensei_analysis_lesson_filter_statuses</a></li><li><a href="sensei_analysis_lesson_grades.html">sensei_analysis_lesson_grades</a></li><li><a href="sensei_analysis_lesson_learners.html">sensei_analysis_lesson_learners</a></li><li><a href="sensei_analysis_lesson_search_users.html">sensei_analysis_lesson_search_users</a></li><li><a href="sensei_analysis_nav_title.html">sensei_analysis_nav_title</a></li><li><a href="sensei_analysis_overview_column_data.html">sensei_analysis_overview_column_data</a></li><li><a href="sensei_analysis_overview_columns.html">sensei_analysis_overview_columns</a></li><li><a href="sensei_analysis_overview_columns_sortable.html">sensei_analysis_overview_columns_sortable</a></li><li><a href="sensei_analysis_overview_courses_columns.html">sensei_analysis_overview_courses_columns</a></li><li><a href="sensei_analysis_overview_courses_columns_sortable.html">sensei_analysis_overview_courses_columns_sortable</a></li><li><a href="sensei_analysis_overview_filter_courses.html">sensei_analysis_overview_filter_courses</a></li><li><a href="sensei_analysis_overview_filter_lessons.html">sensei_analysis_overview_filter_lessons</a></li><li><a href="sensei_analysis_overview_filter_users.html">sensei_analysis_overview_filter_users</a></li><li><a href="sensei_analysis_overview_lessons_columns.html">sensei_analysis_overview_lessons_columns</a></li><li><a href="sensei_analysis_overview_lessons_columns_sortable.html">sensei_analysis_overview_lessons_columns_sortable</a></li><li><a href="sensei_analysis_overview_users_columns.html">sensei_analysis_overview_users_columns</a></li><li><a href="sensei_analysis_overview_users_columns_sortable.html">sensei_analysis_overview_users_columns_sortable</a></li><li><a href="sensei_analysis_overview_%257Btype%257D_columns.html">sensei_analysis_overview_{type}_columns</a></li><li><a href="sensei_analysis_overview_%257Btype%257D_columns_sortable.html">sensei_analysis_overview_{type}_columns_sortable</a></li><li><a href="sensei_analysis_sub_menu.html">sensei_analysis_sub_menu</a></li><li><a href="sensei_analysis_user_courses_ended.html">sensei_analysis_user_courses_ended</a></li><li><a href="sensei_analysis_user_courses_started.html">sensei_analysis_user_courses_started</a></li><li><a href="sensei_analysis_user_lesson_grades.html">sensei_analysis_user_lesson_grades</a></li><li><a href="sensei_analysis_user_profile_columns.html">sensei_analysis_user_profile_columns</a></li><li><a href="sensei_analysis_user_profile_columns_sortable.html">sensei_analysis_user_profile_columns_sortable</a></li><li><a href="sensei_analysis_user_profile_filter_statuses.html">sensei_analysis_user_profile_filter_statuses</a></li><li><a href="sensei_answer_text.html">sensei_answer_text</a></li><li><a href="sensei_archive_courses_per_page.html">sensei_archive_courses_per_page</a></li><li><a href="sensei_autogradable_question_types.html">sensei_autogradable_question_types</a></li><li><a href="sensei_background_job_actions.html">sensei_background_job_actions</a></li><li><a href="sensei_block_course_progress_course_id.html">sensei_block_course_progress_course_id</a></li><li><a href="sensei_block_take_course_course_id.html">sensei_block_take_course_course_id</a></li><li><a href="sensei_block_type_args.html">sensei_block_type_args</a></li><li><a href="sensei_breadcrumb_output.html">sensei_breadcrumb_output</a></li><li><a href="sensei_breadcrumb_separator.html">sensei_breadcrumb_separator</a></li><li><a href="sensei_can_access_course_content.html">sensei_can_access_course_content</a></li><li><a href="sensei_can_use_users_relationship.html">sensei_can_use_users_relationship</a></li><li><a href="sensei_can_user_manually_enrol.html">sensei_can_user_manually_enrol</a></li><li><a href="sensei_can_user_view_lesson.html">sensei_can_user_view_lesson</a></li><li><a href="sensei_can_user_view_module.html">sensei_can_user_view_module</a></li><li><a href="sensei_check_for_activity.html">sensei_check_for_activity</a></li><li><a href="sensei_clock_init.html">sensei_clock_init</a></li><li><a href="sensei_comment_counts_include_sensei_comments.html">sensei_comment_counts_include_sensei_comments</a></li><li><a href="sensei_comments_per_page.html">sensei_comments_per_page</a></li><li><a href="sensei_complete_lesson_redirect_url.html">sensei_complete_lesson_redirect_url</a></li><li><a href="sensei_context_notices.html">sensei_context_notices</a></li><li><a href="sensei_count_statuses.html">sensei_count_statuses</a></li><li><a href="sensei_count_statuses_args.html">sensei_count_statuses_args</a></li><li><a href="sensei_course_archive_page_url.html">sensei_course_archive_page_url</a></li><li><a href="sensei_course_block_template.html">sensei_course_block_template</a></li><li><a href="sensei_course_category_slug.html">sensei_course_category_slug</a></li><li><a href="sensei_course_complete_prerequisite_message.html">sensei_course_complete_prerequisite_message</a></li><li><a href="sensei_course_completed_page_id.html">sensei_course_completed_page_id</a></li><li><a href="sensei_course_completed_page_template.html">sensei_course_completed_page_template</a></li><li><a href="sensei_course_completed_page_url.html">sensei_course_completed_page_url</a></li><li><a href="sensei_course_completion_percentage.html">sensei_course_completion_percentage</a></li><li><a href="sensei_course_completion_statement.html">sensei_course_completion_statement</a></li><li><a href="sensei_course_content_has_access.html">sensei_course_content_has_access</a></li><li><a href="sensei_course_count.html">sensei_course_count</a></li><li><a href="sensei_course_custom_navigation_tabs.html">sensei_course_custom_navigation_tabs</a></li><li><a href="sensei_course_enrolment_providers.html">sensei_course_enrolment_providers</a></li><li><a href="sensei_course_enrolment_providers_prevent_manual_enrol.html">sensei_course_enrolment_providers_prevent_manual_enrol</a></li><li><a href="sensei_course_enrolment_store_results.html">sensei_course_enrolment_store_results</a></li><li><a href="sensei_course_get_lessons.html">sensei_course_get_lessons</a></li><li><a href="sensei_course_image_html.html">sensei_course_image_html</a></li><li><a href="sensei_course_is_prerequisite_complete.html">sensei_course_is_prerequisite_complete</a></li><li><a href="sensei_course_learning_mode_enabled.html">sensei_course_learning_mode_enabled</a></li><li><a href="sensei_course_learning_mode_theme_override_enabled.html">sensei_course_learning_mode_theme_override_enabled</a></li><li><a href="sensei_course_list_block_patterns_extra_links.html">sensei_course_list_block_patterns_extra_links</a></li><li><a href="sensei_course_loop_content_class.html">sensei_course_loop_content_class</a></li><li><a href="sensei_course_loop_number_of_columns.html">sensei_course_loop_number_of_columns</a></li><li><a href="sensei_course_meta_default_save.html">sensei_course_meta_default_save</a></li><li><a href="sensei_course_meta_fields.html">sensei_course_meta_fields</a></li><li><a href="sensei_course_open_access.html">sensei_course_open_access</a></li><li><a href="sensei_course_pass_grade.html">sensei_course_pass_grade</a></li><li><a href="sensei_course_placeholder_image_url.html">sensei_course_placeholder_image_url</a></li><li><a href="sensei_course_progress_create_course_id.html">sensei_course_progress_create_course_id</a></li><li><a href="sensei_course_progress_delete_for_course_course_id.html">sensei_course_progress_delete_for_course_course_id</a></li><li><a href="sensei_course_progress_find_course_id.html">sensei_course_progress_find_course_id</a></li><li><a href="sensei_course_progress_get_course_id.html">sensei_course_progress_get_course_id</a></li><li><a href="sensei_course_progress_has_course_id.html">sensei_course_progress_has_course_id</a></li><li><a href="sensei_course_progress_stats.html">sensei_course_progress_stats</a></li><li><a href="sensei_course_show_lessons.html">sensei_course_show_lessons</a></li><li><a href="sensei_course_slug.html">sensei_course_slug</a></li><li><a href="sensei_course_start_course_id.html">sensei_course_start_course_id</a></li><li><a href="sensei_course_the_title.html">sensei_course_the_title</a></li><li><a href="sensei_course_user_grade.html">sensei_course_user_grade</a></li><li><a href="sensei_courses_navigation_sidebar.html">sensei_courses_navigation_sidebar</a></li><li><a href="sensei_courses_page_template.html">sensei_courses_page_template</a></li><li><a href="sensei_csv_export_filename.html">sensei_csv_export_filename</a></li><li><a href="sensei_custom_navigation_allowed_screens.html">sensei_custom_navigation_allowed_screens</a></li><li><a href="sensei_default_feature_flag_settings.html">sensei_default_feature_flag_settings</a></li><li><a href="sensei_disable_styles.html">sensei_disable_styles</a></li><li><a href="sensei_do_link_to_module.html">sensei_do_link_to_module</a></li><li><a href="sensei_duplicate_post_args.html">sensei_duplicate_post_args</a></li><li><a href="sensei_duplicate_post_ignore_meta.html">sensei_duplicate_post_ignore_meta</a></li><li><a href="sensei_email.html">sensei_email</a></li><li><a href="sensei_email_classes.html">sensei_email_classes</a></li><li><a href="sensei_email_course_teachers.html">sensei_email_course_teachers</a></li><li><a href="sensei_email_data.html">sensei_email_data</a></li><li><a href="sensei_email_generators.html">sensei_email_generators</a></li><li><a href="sensei_email_heading.html">sensei_email_heading</a></li><li><a href="sensei_email_is_available.html">sensei_email_is_available</a></li><li><a href="sensei_email_list_columns.html">sensei_email_list_columns</a></li><li><a href="sensei_email_list_row_actions.html">sensei_email_list_row_actions</a></li><li><a href="sensei_email_list_row_data.html">sensei_email_list_row_data</a></li><li><a href="sensei_email_mailpoet_feature.html">sensei_email_mailpoet_feature</a></li><li><a href="sensei_email_replacements.html">sensei_email_replacements</a></li><li><a href="sensei_email_seeder_data.html">sensei_email_seeder_data</a></li><li><a href="sensei_email_subject.html">sensei_email_subject</a></li><li><a href="sensei_enable_enrolment_provider_journal.html">sensei_enable_enrolment_provider_journal</a></li><li><a href="sensei_enrolment_course_calculation_job_batch_size.html">sensei_enrolment_course_calculation_job_batch_size</a></li><li><a href="sensei_enrolment_history_size.html">sensei_enrolment_history_size</a></li><li><a href="sensei_enrolment_learner_calculation_job_batch_size.html">sensei_enrolment_learner_calculation_job_batch_size</a></li><li><a href="sensei_enrolment_message_log_size.html">sensei_enrolment_message_log_size</a></li><li><a href="sensei_event_logging_base_fields.html">sensei_event_logging_base_fields</a></li><li><a href="sensei_existing_questions_query_results.html">sensei_existing_questions_query_results</a></li><li><a href="sensei_feature_course_preview_lessons.html">sensei_feature_course_preview_lessons</a></li><li><a href="sensei_feature_open_access_courses.html">sensei_feature_open_access_courses</a></li><li><a href="sensei_feature_preview_students.html">sensei_feature_preview_students</a></li><li><a href="sensei_file_upload_args.html">sensei_file_upload_args</a></li><li><a href="sensei_file_upload_file_prefix.html">sensei_file_upload_file_prefix</a></li><li><a href="sensei_filter_category_questions_by_author.html">sensei_filter_category_questions_by_author</a></li><li><a href="sensei_filter_module_terms_by_owner.html">sensei_filter_module_terms_by_owner</a></li><li><a href="sensei_filter_queries_set_author.html">sensei_filter_queries_set_author</a></li><li><a href="sensei_frontend_learner_enrolment_handler.html">sensei_frontend_learner_enrolment_handler</a></li><li><a href="sensei_gap_fill_case_sensitive_grading.html">sensei_gap_fill_case_sensitive_grading</a></li><li><a href="sensei_get_all_courses.html">sensei_get_all_courses</a></li><li><a href="sensei_get_image_size_%25257Bimage_size%25257D.html">sensei_get_image_size_{image_size}</a></li><li><a href="sensei_get_question_grade.html">sensei_get_question_grade</a></li><li><a href="sensei_get_question_template_data.html">sensei_get_question_template_data</a></li><li><a href="sensei_get_%257Bpage%257D_page_id.html">sensei_get_{page}_page_id</a></li><li><a href="sensei_grade_question_auto.html">sensei_grade_question_auto</a></li><li><a href="sensei_grading_allowed_user_ids.html">sensei_grading_allowed_user_ids</a></li><li><a href="sensei_grading_count_statues.html">sensei_grading_count_statues</a></li><li><a href="sensei_grading_count_statuses.html">sensei_grading_count_statuses</a></li><li><a href="sensei_grading_default_columns.html">sensei_grading_default_columns</a></li><li><a href="sensei_grading_default_columns_sortable.html">sensei_grading_default_columns_sortable</a></li><li><a href="sensei_grading_display_quiz_question.html">sensei_grading_display_quiz_question</a></li><li><a href="sensei_grading_filter_courses.html">sensei_grading_filter_courses</a></li><li><a href="sensei_grading_filter_lessons.html">sensei_grading_filter_lessons</a></li><li><a href="sensei_grading_filter_statuses.html">sensei_grading_filter_statuses</a></li><li><a href="sensei_grading_main_column_data.html">sensei_grading_main_column_data</a></li><li><a href="sensei_grading_nav_title.html">sensei_grading_nav_title</a></li><li><a href="sensei_grading_search_users.html">sensei_grading_search_users</a></li><li><a href="sensei_grading_sub_menu.html">sensei_grading_sub_menu</a></li><li><a href="sensei_guest_user_supported_actions.html">sensei_guest_user_supported_actions</a></li><li><a href="sensei_home_is_plugin_licensed_%257B$plugin_slug%257D.html">sensei_home_is_plugin_licensed_{$plugin_slug}</a></li><li><a href="sensei_home_promo_banner_show.html">sensei_home_promo_banner_show</a></li><li><a href="sensei_home_remote_data_other_plugins.html">sensei_home_remote_data_other_plugins</a></li><li><a href="sensei_home_remote_data_primary_plugin_slug.html">sensei_home_remote_data_primary_plugin_slug</a></li><li><a href="sensei_home_remote_data_retry_error.html">sensei_home_remote_data_retry_error</a></li><li><a href="sensei_home_support_ticket_creation_upsell_show.html">sensei_home_support_ticket_creation_upsell_show</a></li><li><a href="sensei_home_tasks.html">sensei_home_tasks</a></li><li><a href="sensei_hpps_cache_enabled.html">sensei_hpps_cache_enabled</a></li><li><a href="sensei_icon_href.html">sensei_icon_href</a></li><li><a href="sensei_import_attachment_request_timeout.html">sensei_import_attachment_request_timeout</a></li><li><a href="sensei_import_csv_delimiter.html">sensei_import_csv_delimiter</a></li><li><a href="sensei_import_csv_delimiter_options.html">sensei_import_csv_delimiter_options</a></li><li><a href="sensei_is_enrolled.html">sensei_is_enrolled</a></li><li><a href="sensei_is_enrolment_background_job_enabled.html">sensei_is_enrolment_background_job_enabled</a></li><li><a href="sensei_is_legacy_enrolled.html">sensei_is_legacy_enrolled</a></li><li><a href="sensei_is_login_required.html">sensei_is_login_required</a></li><li><a href="sensei_learner_admin_get_row_data.html">sensei_learner_admin_get_row_data</a></li><li><a href="sensei_learner_courses_page_template.html">sensei_learner_courses_page_template</a></li><li><a href="sensei_learner_enrolled_courses_args.html">sensei_learner_enrolled_courses_args</a></li><li><a href="sensei_learner_full_name.html">sensei_learner_full_name</a></li><li><a href="sensei_learner_get_course_ids_by_progress_status_course_ids.html">sensei_learner_get_course_ids_by_progress_status_course_ids</a></li><li><a href="sensei_learner_get_enrolled_courses_query_args_term_id.html">sensei_learner_get_enrolled_courses_query_args_term_id</a></li><li><a href="sensei_learner_profile_courses_heading.html">sensei_learner_profile_courses_heading</a></li><li><a href="sensei_learner_profile_courses_heading_name.html">sensei_learner_profile_courses_heading_name</a></li><li><a href="sensei_learner_profile_info_avatar.html">sensei_learner_profile_info_avatar</a></li><li><a href="sensei_learner_profile_info_bio.html">sensei_learner_profile_info_bio</a></li><li><a href="sensei_learner_profile_info_name.html">sensei_learner_profile_info_name</a></li><li><a href="sensei_learner_profile_permalink.html">sensei_learner_profile_permalink</a></li><li><a href="sensei_learner_profiles_url_base.html">sensei_learner_profiles_url_base</a></li><li><a href="sensei_learners_add_learner_redirect_url.html">sensei_learners_add_learner_redirect_url</a></li><li><a href="sensei_learners_admin_get_known_bulk_actions.html">sensei_learners_admin_get_known_bulk_actions</a></li><li><a href="sensei_learners_allowed_user_ids.html">sensei_learners_allowed_user_ids</a></li><li><a href="sensei_learners_default_columns.html">sensei_learners_default_columns</a></li><li><a href="sensei_learners_default_columns_sortable.html">sensei_learners_default_columns_sortable</a></li><li><a href="sensei_learners_filter_courses.html">sensei_learners_filter_courses</a></li><li><a href="sensei_learners_filter_lessons.html">sensei_learners_filter_lessons</a></li><li><a href="sensei_learners_filter_users.html">sensei_learners_filter_users</a></li><li><a href="sensei_learners_learner_updated.html">sensei_learners_learner_updated</a></li><li><a href="sensei_learners_nav_title.html">sensei_learners_nav_title</a></li><li><a href="sensei_learners_no_items_text.html">sensei_learners_no_items_text</a></li><li><a href="sensei_learners_query.html">sensei_learners_query</a></li><li><a href="sensei_learners_search_users.html">sensei_learners_search_users</a></li><li><a href="sensei_learners_sub_menu.html">sensei_learners_sub_menu</a></li><li><a href="sensei_learning_mode_block_templates.html">sensei_learning_mode_block_templates</a></li><li><a href="sensei_learning_mode_lesson_status_icon.html">sensei_learning_mode_lesson_status_icon</a></li><li><a href="sensei_lesson_archive_title.html">sensei_lesson_archive_title</a></li><li><a href="sensei_lesson_block_template.html">sensei_lesson_block_template</a></li><li><a href="sensei_lesson_content_drip_hide.html">sensei_lesson_content_drip_hide</a></li><li><a href="sensei_lesson_count.html">sensei_lesson_count</a></li><li><a href="sensei_lesson_course_signup_notice_level.html">sensei_lesson_course_signup_notice_level</a></li><li><a href="sensei_lesson_course_signup_notice_message.html">sensei_lesson_course_signup_notice_message</a></li><li><a href="sensei_lesson_excerpt.html">sensei_lesson_excerpt</a></li><li><a href="sensei_lesson_placeholder_image_url.html">sensei_lesson_placeholder_image_url</a></li><li><a href="sensei_lesson_prerequisite.html">sensei_lesson_prerequisite</a></li><li><a href="sensei_lesson_preview_title_text.html">sensei_lesson_preview_title_text</a></li><li><a href="sensei_lesson_progress_count_course_id.html">sensei_lesson_progress_count_course_id</a></li><li><a href="sensei_lesson_progress_create_lesson_id.html">sensei_lesson_progress_create_lesson_id</a></li><li><a href="sensei_lesson_progress_delete_for_lesson_lesson_id.html">sensei_lesson_progress_delete_for_lesson_lesson_id</a></li><li><a href="sensei_lesson_progress_find_lesson_id.html">sensei_lesson_progress_find_lesson_id</a></li><li><a href="sensei_lesson_progress_get_lesson_id.html">sensei_lesson_progress_get_lesson_id</a></li><li><a href="sensei_lesson_progress_has_lesson_id.html">sensei_lesson_progress_has_lesson_id</a></li><li><a href="sensei_lesson_quiz_questions.html">sensei_lesson_quiz_questions</a></li><li><a href="sensei_lesson_show_actions.html">sensei_lesson_show_actions</a></li><li><a href="sensei_lesson_show_course_signup_notice.html">sensei_lesson_show_course_signup_notice</a></li><li><a href="sensei_lesson_slug.html">sensei_lesson_slug</a></li><li><a href="sensei_lesson_tag_archive_description.html">sensei_lesson_tag_archive_description</a></li><li><a href="sensei_lesson_tag_archive_title.html">sensei_lesson_tag_archive_title</a></li><li><a href="sensei_lesson_tag_slug.html">sensei_lesson_tag_slug</a></li><li><a href="sensei_lesson_take_course_url.html">sensei_lesson_take_course_url</a></li><li><a href="sensei_list_bulk_actions.html">sensei_list_bulk_actions</a></li><li><a href="sensei_list_table_search_button_text.html">sensei_list_table_search_button_text</a></li><li><a href="sensei_lms_schema_get_tables.html">sensei_lms_schema_get_tables</a></li><li><a href="sensei_load_default_supported_theme_wrappers.html">sensei_load_default_supported_theme_wrappers</a></li><li><a href="sensei_locate_template.html">sensei_locate_template</a></li><li><a href="sensei_log_event.html">sensei_log_event</a></li><li><a href="sensei_login_logout_menu_title.html">sensei_login_logout_menu_title</a></li><li><a href="sensei_login_success_redirect_url.html">sensei_login_success_redirect_url</a></li><li><a href="sensei_login_url.html">sensei_login_url</a></li><li><a href="sensei_message_archive_title.html">sensei_message_archive_title</a></li><li><a href="sensei_messages_send_message_link.html">sensei_messages_send_message_link</a></li><li><a href="sensei_messages_slug.html">sensei_messages_slug</a></li><li><a href="sensei_module_archive_description.html">sensei_module_archive_description</a></li><li><a href="sensei_module_archive_title.html">sensei_module_archive_title</a></li><li><a href="sensei_module_course_column_max_links_count.html">sensei_module_course_column_max_links_count</a></li><li><a href="sensei_module_course_signup_notice_level.html">sensei_module_course_signup_notice_level</a></li><li><a href="sensei_module_course_signup_notice_message.html">sensei_module_course_signup_notice_message</a></li><li><a href="sensei_module_show_course_signup_notice.html">sensei_module_show_course_signup_notice</a></li><li><a href="sensei_module_slug.html">sensei_module_slug</a></li><li><a href="sensei_modules_title.html">sensei_modules_title</a></li><li><a href="sensei_multiple_question_slug.html">sensei_multiple_question_slug</a></li><li><a href="sensei_my_courses_per_page.html">sensei_my_courses_per_page</a></li><li><a href="sensei_notice.html">sensei_notice</a></li><li><a href="sensei_notices_screen_ids.html">sensei_notices_screen_ids</a></li><li><a href="sensei_notify_admin_new_course_creation.html">sensei_notify_admin_new_course_creation</a></li><li><a href="sensei_placeholder_thumbnail.html">sensei_placeholder_thumbnail</a></li><li><a href="sensei_pre_grade_question_auto.html">sensei_pre_grade_question_auto</a></li><li><a href="sensei_pre_kses.html">sensei_pre_kses</a></li><li><a href="sensei_question_answer_message_correct_answer.html">sensei_question_answer_message_correct_answer</a></li><li><a href="sensei_question_answer_message_css_class.html">sensei_question_answer_message_css_class</a></li><li><a href="sensei_question_answer_message_grade.html">sensei_question_answer_message_grade</a></li><li><a href="sensei_question_answer_message_text.html">sensei_question_answer_message_text</a></li><li><a href="sensei_question_answer_notes.html">sensei_question_answer_notes</a></li><li><a href="sensei_question_category_slug.html">sensei_question_category_slug</a></li><li><a href="sensei_question_classes.html">sensei_question_classes</a></li><li><a href="sensei_question_image_size.html">sensei_question_image_size</a></li><li><a href="sensei_question_show_answers.html">sensei_question_show_answers</a></li><li><a href="sensei_question_title.html">sensei_question_title</a></li><li><a href="sensei_question_type_slug.html">sensei_question_type_slug</a></li><li><a href="sensei_question_type_specific_properties.html">sensei_question_type_specific_properties</a></li><li><a href="sensei_question_types.html">sensei_question_types</a></li><li><a href="sensei_questions_get_correct_answer.html">sensei_questions_get_correct_answer</a></li><li><a href="sensei_quiz_answer_create_question_id.html">sensei_quiz_answer_create_question_id</a></li><li><a href="sensei_quiz_answer_create_submission_id.html">sensei_quiz_answer_create_submission_id</a></li><li><a href="sensei_quiz_answer_delete_all_submission_id.html">sensei_quiz_answer_delete_all_submission_id</a></li><li><a href="sensei_quiz_answer_file_upload_types.html">sensei_quiz_answer_file_upload_types</a></li><li><a href="sensei_quiz_answer_get_all_submission_id.html">sensei_quiz_answer_get_all_submission_id</a></li><li><a href="sensei_quiz_course_signup_notice_message.html">sensei_quiz_course_signup_notice_message</a></li><li><a href="sensei_quiz_enable_block_based_editor.html">sensei_quiz_enable_block_based_editor</a></li><li><a href="sensei_quiz_grade_create_answer_id.html">sensei_quiz_grade_create_answer_id</a></li><li><a href="sensei_quiz_grade_create_question_id.html">sensei_quiz_grade_create_question_id</a></li><li><a href="sensei_quiz_grade_create_submission_id.html">sensei_quiz_grade_create_submission_id</a></li><li><a href="sensei_quiz_grade_delete_all_submission_id.html">sensei_quiz_grade_delete_all_submission_id</a></li><li><a href="sensei_quiz_grade_get_all_submission_id.html">sensei_quiz_grade_get_all_submission_id</a></li><li><a href="sensei_quiz_grade_save_many_question_id.html">sensei_quiz_grade_save_many_question_id</a></li><li><a href="sensei_quiz_grade_save_many_submission_id.html">sensei_quiz_grade_save_many_submission_id</a></li><li><a href="sensei_quiz_ordering_question_type_hide.html">sensei_quiz_ordering_question_type_hide</a></li><li><a href="sensei_quiz_pagination_args.html">sensei_quiz_pagination_args</a></li><li><a href="sensei_quiz_panel_add.html">sensei_quiz_panel_add</a></li><li><a href="sensei_quiz_progress_create_quiz_id.html">sensei_quiz_progress_create_quiz_id</a></li><li><a href="sensei_quiz_progress_delete_for_quiz_quiz_id.html">sensei_quiz_progress_delete_for_quiz_quiz_id</a></li><li><a href="sensei_quiz_progress_find_quiz_id.html">sensei_quiz_progress_find_quiz_id</a></li><li><a href="sensei_quiz_progress_get_quiz_id.html">sensei_quiz_progress_get_quiz_id</a></li><li><a href="sensei_quiz_progress_has_quiz_id.html">sensei_quiz_progress_has_quiz_id</a></li><li><a href="sensei_quiz_question_ai_upsell_scripts.html">sensei_quiz_question_ai_upsell_scripts</a></li><li><a href="sensei_quiz_question_points_format.html">sensei_quiz_question_points_format</a></li><li><a href="sensei_quiz_settings.html">sensei_quiz_settings</a></li><li><a href="sensei_quiz_slug.html">sensei_quiz_slug</a></li><li><a href="sensei_quiz_submission_create_quiz_id.html">sensei_quiz_submission_create_quiz_id</a></li><li><a href="sensei_quiz_submission_get_or_create_quiz_id.html">sensei_quiz_submission_get_or_create_quiz_id</a></li><li><a href="sensei_quiz_submission_get_question_ids_submission_id.html">sensei_quiz_submission_get_question_ids_submission_id</a></li><li><a href="sensei_quiz_submission_get_quiz_id.html">sensei_quiz_submission_get_quiz_id</a></li><li><a href="sensei_quiz_type_slug.html">sensei_quiz_type_slug</a></li><li><a href="sensei_register_post_type_course.html">sensei_register_post_type_course</a></li><li><a href="sensei_register_post_type_lesson.html">sensei_register_post_type_lesson</a></li><li><a href="sensei_register_post_type_question.html">sensei_register_post_type_question</a></li><li><a href="sensei_register_post_type_quiz.html">sensei_register_post_type_quiz</a></li><li><a href="sensei_register_post_type_sensei_message.html">sensei_register_post_type_sensei_message</a></li><li><a href="sensei_registration_redirect.html">sensei_registration_redirect</a></li><li><a href="sensei_registration_url.html">sensei_registration_url</a></li><li><a href="sensei_reports_overview_export_button_url.html">sensei_reports_overview_export_button_url</a></li><li><a href="sensei_rest_api_lesson_quiz_response.html">sensei_rest_api_lesson_quiz_response</a></li><li><a href="sensei_rest_api_schema_question_type.html">sensei_rest_api_schema_question_type</a></li><li><a href="sensei_rest_api_schema_single_question.html">sensei_rest_api_schema_single_question</a></li><li><a href="sensei_restrict_posts_menu_page.html">sensei_restrict_posts_menu_page</a></li><li><a href="sensei_results_links.html">sensei_results_links</a></li><li><a href="sensei_round_mode.html">sensei_round_mode</a></li><li><a href="sensei_round_precision.html">sensei_round_precision</a></li><li><a href="sensei_scheduler_class.html">sensei_scheduler_class</a></li><li><a href="sensei_scripts_allowed_pages.html">sensei_scripts_allowed_pages</a></li><li><a href="sensei_scripts_allowed_post_type_pages.html">sensei_scripts_allowed_post_type_pages</a></li><li><a href="sensei_scripts_allowed_post_types.html">sensei_scripts_allowed_post_types</a></li><li><a href="sensei_self_enrollment_not_allowed.html">sensei_self_enrollment_not_allowed</a></li><li><a href="sensei_send_emails.html">sensei_send_emails</a></li><li><a href="sensei_settings_content.html">sensei_settings_content</a></li><li><a href="sensei_settings_content_drip_hide.html">sensei_settings_content_drip_hide</a></li><li><a href="sensei_settings_fields.html">sensei_settings_fields</a></li><li><a href="sensei_settings_my_course_page_id.html">sensei_settings_my_course_page_id</a></li><li><a href="sensei_settings_tabs.html">sensei_settings_tabs</a></li><li><a href="sensei_settings_woocommerce_hide.html">sensei_settings_woocommerce_hide</a></li><li><a href="sensei_shortcode_user_courses_display_course_toggle_actions.html">sensei_shortcode_user_courses_display_course_toggle_actions</a></li><li><a href="sensei_should_defer_enrolment_check.html">sensei_should_defer_enrolment_check</a></li><li><a href="sensei_show_admin_notices_%257B$screen_id%257D.html">sensei_show_admin_notices_{$screen_id}</a></li><li><a href="sensei_show_enrolment_debug_button.html">sensei_show_enrolment_debug_button</a></li><li><a href="sensei_show_lesson_numbers.html">sensei_show_lesson_numbers</a></li><li><a href="sensei_show_main_footer.html">sensei_show_main_footer</a></li><li><a href="sensei_show_main_header.html">sensei_show_main_header</a></li><li><a href="sensei_single_title.html">sensei_single_title</a></li><li><a href="sensei_start_course_redirect_url.html">sensei_start_course_redirect_url</a></li><li><a href="sensei_student_groups_hide.html">sensei_student_groups_hide</a></li><li><a href="sensei_student_progress_read_from_tables.html">sensei_student_progress_read_from_tables</a></li><li><a href="sensei_students_report_last_activity_filter_enabled.html">sensei_students_report_last_activity_filter_enabled</a></li><li><a href="sensei_teacher_archive_query.html">sensei_teacher_archive_query</a></li><li><a href="sensei_teacher_course_ids.html">sensei_teacher_course_ids</a></li><li><a href="sensei_teachers_shortcode_list_item.html">sensei_teachers_shortcode_list_item</a></li><li><a href="sensei_template_url.html">sensei_template_url</a></li><li><a href="sensei_the_module_description.html">sensei_the_module_description</a></li><li><a href="sensei_the_module_id.html">sensei_the_module_id</a></li><li><a href="sensei_the_module_permalink.html">sensei_the_module_permalink</a></li><li><a href="sensei_the_module_status_html.html">sensei_the_module_status_html</a></li><li><a href="sensei_the_module_title.html">sensei_the_module_title</a></li><li><a href="sensei_the_no_permissions_message.html">sensei_the_no_permissions_message</a></li><li><a href="sensei_the_no_permissions_title.html">sensei_the_no_permissions_title</a></li><li><a href="sensei_the_question_number.html">sensei_the_question_number</a></li><li><a href="sensei_the_title_classes.html">sensei_the_title_classes</a></li><li><a href="sensei_the_title_html_tag.html">sensei_the_title_html_tag</a></li><li><a href="sensei_tools.html">sensei_tools</a></li><li><a href="sensei_usage_tracking_data.html">sensei_usage_tracking_data</a></li><li><a href="sensei_use_wp_register_link.html">sensei_use_wp_register_link</a></li><li><a href="sensei_user_completed_lesson.html">sensei_user_completed_lesson</a></li><li><a href="sensei_user_course_status_%257Bstatus%257D.html">sensei_user_course_status_{status}</a></li><li><a href="sensei_user_courses_filter_options.html">sensei_user_courses_filter_options</a></li><li><a href="sensei_user_courses_query.html">sensei_user_courses_query</a></li><li><a href="sensei_user_question_feedback.html">sensei_user_question_feedback</a></li><li><a href="sensei_user_quiz_status.html">sensei_user_quiz_status</a></li><li><a href="sensei_user_quiz_status_%257Bstatus%257D.html">sensei_user_quiz_status_{status}</a></li><li><a href="sensei_user_started_course.html">sensei_user_started_course</a></li><li><a href="sensei_utils_user_completed_lesson_lesson_id.html">sensei_utils_user_completed_lesson_lesson_id</a></li><li><a href="sensei_video_position.html">sensei_video_position</a></li><li><a href="sensei_wpcom_product_slugs.html">sensei_wpcom_product_slugs</a></li><li><a href="widget_course_categories_args.html">widget_course_categories_args</a></li><li><a href="widget_course_categories_dropdown_args.html">widget_course_categories_dropdown_args</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>
